@@ -1,4 +1,5 @@
-"""Process tools: spike-correlated process capture and two-step guarded kill.
+"""Process tools: spike-correlated process capture, plus the snapshot helpers the kill tool
+(control/kill.py) reuses.
 
 How DeviceOn delivers process lists (verified in WebApp/Worker source):
 - The periodic auto-report usually carries only "System Monitor Info" (CPU/memory),
@@ -20,7 +21,6 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from ...analysis import pearson
 from ...client import DeviceOnError
-from ...config import PROTECTED_PIDS
 from ...deps import Deps, ProgressFn
 from ...senml import entries_to_dict, snapshot_ts_ms, to_number
 from ..common.devices import get_device_checked
@@ -30,6 +30,10 @@ log = logging.getLogger("deviceon_mcp.audit")
 PROCESS_PLUGIN = "ProcessMonitor"
 KILL_ACTION = "kill_process"
 MIN_SPIKE_SPREAD = 20.0  # system CPU percentage points between quiet and spike snapshots
+# System memory must move by at least max(500 MB, 5% of RAM) to count as a spike. On the
+# reference device (30 GB) idle usage drifts ~7% over an hour but far less within one capture.
+MIN_MEM_SPREAD_MB = 500.0
+MIN_MEM_SPREAD_RATIO = 0.05
 POLL_SEC = 2  # how often we read the live snapshot while waiting for fresh data
 
 
@@ -48,6 +52,8 @@ class Snapshot:
     system_cpu: float | None
     procs: dict[int, Proc]
     has_list: bool  # False when the report carried no process list (e.g. periodic auto-report)
+    mem_used_mb: float | None = None   # totalPhysMemKB - availPhysMemKB
+    mem_total_mb: float | None = None
 
 
 def parse_snapshot(pm: dict) -> Snapshot:
@@ -68,7 +74,13 @@ def parse_snapshot(pm: dict) -> Snapshot:
             mem_kb=to_number(e.get("Mem Usage")),
         )
     system = entries_to_dict((pm.get("System Monitor Info") or {}).get("e"))
-    return Snapshot(snapshot_ts_ms(pm), to_number(system.get("CPU Usage")), procs, has_list=bool(procs))
+    total_kb, avail_kb = to_number(system.get("totalPhysMemKB")), to_number(system.get("availPhysMemKB"))
+    has_mem = bool(total_kb) and avail_kb is not None
+    return Snapshot(
+        snapshot_ts_ms(pm), to_number(system.get("CPU Usage")), procs, has_list=bool(procs),
+        mem_used_mb=(total_kb - avail_kb) / 1024 if has_mem else None,  # type: ignore[operator]
+        mem_total_mb=total_kb / 1024 if has_mem else None,  # type: ignore[operator]
+    )
 
 
 async def _read(deps: Deps, dev: dict) -> Snapshot:
@@ -136,17 +148,88 @@ def _require_online(dev: dict) -> None:
 # capture_top_processes
 # --------------------------------------------------------------------------
 
+METRICS = ("cpu", "memory")
+# Key that ranks processes while a spike was caught / when no spike was caught.
+_SPIKE_KEY = {"cpu": "avg_cpu_during_spike", "memory": "spike_delta_mb"}
+_CALM_KEY = {"cpu": "avg_cpu", "memory": "growth_mb"}
+_AVG_KEY = {"cpu": "avg_cpu", "memory": "avg_mem_mb"}
 
-def _stats(series: list[float], system: list[float], high_idx: list[int]) -> dict:
+
+def _sys_value(s: Snapshot, metric: str) -> float | None:
+    return s.system_cpu if metric == "cpu" else s.mem_used_mb
+
+
+def _proc_value(p: Proc, metric: str) -> float:
+    return p.cpu if metric == "cpu" else (p.mem_kb or 0.0) / 1024
+
+
+def _mean(vals: list[float]) -> float | None:
+    return sum(vals) / len(vals) if vals else None
+
+
+def _mem_spread_threshold(snaps: list[Snapshot]) -> float:
+    total = next((s.mem_total_mb for s in reversed(snaps) if s.mem_total_mb), None)
+    return max(MIN_MEM_SPREAD_MB, MIN_MEM_SPREAD_RATIO * total) if total else MIN_MEM_SPREAD_MB
+
+
+def _stats(series: list[float], system: list[float], high_idx: list[int], metric: str) -> dict:
     present = sum(1 for v in series if v > 0)
     corr = pearson(series, system)
-    return {
-        "avg_cpu": round(sum(series) / len(series), 1),
-        "max_cpu": round(max(series), 1),
-        "avg_cpu_during_spike": round(sum(series[i] for i in high_idx) / len(high_idx), 1) if high_idx else None,
+    common = {
         "correlation": round(corr, 2) if corr is not None else None,
         "present_ratio": round(present / len(series), 2),
     }
+    high = [series[i] for i in high_idx]
+    if metric == "cpu":
+        return {
+            "avg_cpu": round(sum(series) / len(series), 1),
+            "max_cpu": round(max(series), 1),
+            "avg_cpu_during_spike": round(_mean(high), 1) if high else None,
+            **common,
+        }
+    hs = set(high_idx)
+    low = [v for i, v in enumerate(series) if i not in hs]
+    delta = _mean(high) - _mean(low) if high and low else None  # type: ignore[operator]
+    return {
+        "avg_mem_mb": round(sum(series) / len(series), 1),
+        "max_mem_mb": round(max(series), 1),
+        "growth_mb": round(max(series) - min(series), 1),
+        "spike_delta_mb": round(delta, 1) if delta is not None else None,
+        **common,
+    }
+
+
+def _lifecycles(snaps: list[Snapshot]) -> dict[str, dict]:
+    """Per process name: which pids were seen, how many ran at once, how often it was present."""
+    out: dict[str, dict] = {}
+    for s in snaps:
+        here: dict[str, list[int]] = {}
+        for p in s.procs.values():
+            here.setdefault(p.name, []).append(p.pid)
+        for name, pids in here.items():
+            lc = out.setdefault(name, {"pids_seen": [], "max_concurrent": 0, "_present": 0})
+            lc["_present"] += 1
+            lc["max_concurrent"] = max(lc["max_concurrent"], len(pids))
+            lc["pids_seen"].extend(p for p in sorted(pids) if p not in lc["pids_seen"])
+    for lc in out.values():
+        lc["present_ratio"] = round(lc.pop("_present") / len(snaps), 2)
+        # New pid(s) over time but never two at once: the program is being restarted.
+        lc["respawned"] = len(lc["pids_seen"]) > 1 and lc["max_concurrent"] == 1
+    return out
+
+
+def _recurrence_hint(lc: dict) -> str | None:
+    if lc["respawned"]:
+        what = f"ran as {len(lc['pids_seen'])} different pids one after another during the capture"
+    elif lc["present_ratio"] < 1:
+        what = "started or exited during the capture"
+    else:
+        return None
+    return (
+        f"this program {what}, so it is likely launched periodically (Task Scheduler, cron, a service "
+        "restart or a parent process). Killing it only ends the current run, and the run may already have "
+        "ended; tell the user to check what launches it on the device."
+    )
 
 
 async def capture_top_processes(
@@ -155,8 +238,12 @@ async def capture_top_processes(
     duration_sec: int = 60,
     samples: int = 12,
     top_n: int = 5,
+    metric: str = "cpu",
     progress: ProgressFn | None = None,
 ) -> dict:
+    metric = metric.strip().lower()
+    if metric not in METRICS:
+        raise ToolError(f"metric must be one of {', '.join(METRICS)}")
     duration_sec = max(5, min(duration_sec, 600))
     samples = max(3, min(samples, 60))
     top_n = max(1, min(top_n, 20))
@@ -172,6 +259,7 @@ async def capture_top_processes(
 
     result: dict = {
         "device": {"did": did, "name": dev.get("name")},
+        "metric": metric,
         "intermittent_report": live,
         "requested_samples": samples,
         "notes": [],
@@ -195,7 +283,7 @@ async def capture_top_processes(
     result["process_list_available"] = True
 
     # 3. Sample. Keep only full snapshots with a server timestamp we haven't seen.
-    snaps: list[Snapshot] = [first] if first.system_cpu is not None else []
+    snaps: list[Snapshot] = [first] if _sys_value(first, metric) is not None else []
     seen_ts: set[int] = {first.ts_ms} if first.ts_ms is not None else set()
     skipped_partial = 0
     for i in range(1, samples):
@@ -203,7 +291,7 @@ async def capture_top_processes(
         snap = await _read(deps, dev)
         if not snap.has_list or not _newer(snap, baseline.ts_ms):
             skipped_partial += 1
-        elif snap.ts_ms not in seen_ts and snap.system_cpu is not None:
+        elif snap.ts_ms not in seen_ts and _sys_value(snap, metric) is not None:
             seen_ts.add(snap.ts_ms)  # type: ignore[arg-type]
             snaps.append(snap)
         if progress:
@@ -220,169 +308,131 @@ async def capture_top_processes(
             result["suspect"] = None
             return result
 
-    system = [s.system_cpu for s in snaps]  # type: ignore[misc]
+    # 4. Did the capture catch a spike of the chosen metric?
+    system = [_sys_value(s, metric) for s in snaps]  # type: ignore[misc]
     lo, hi = min(system), max(system)
-    spike_observed = hi - lo >= MIN_SPIKE_SPREAD
+    if metric == "cpu":
+        spike_observed = hi - lo >= MIN_SPIKE_SPREAD
+        result["system_cpu"] = {"min": lo, "max": hi, "spike_observed": spike_observed}
+        if not spike_observed:
+            result["notes"].append(
+                f"system CPU varied only {hi - lo:.0f} points during capture; no spike was caught, so the "
+                "ranking below reflects average load, not the spike. Re-run timed with next_peak_eta_sec."
+            )
+            mem = [s.mem_used_mb for s in snaps if s.mem_used_mb is not None]
+            if mem and max(mem) - min(mem) >= _mem_spread_threshold(snaps):
+                result["notes"].append(
+                    f"system memory did change by {max(mem) - min(mem):.0f} MB during the capture; "
+                    "if the anomaly is memory, re-run with metric='memory'."
+                )
+    else:
+        threshold = _mem_spread_threshold(snaps)
+        spike_observed = hi - lo >= threshold
+        result["system_memory"] = {
+            "min_used_mb": round(lo), "max_used_mb": round(hi),
+            "total_mb": round(snaps[-1].mem_total_mb) if snaps[-1].mem_total_mb else None,
+            "spike_threshold_mb": round(threshold), "spike_observed": spike_observed,
+        }
+        if not spike_observed:
+            result["notes"].append(
+                f"system memory varied only {hi - lo:.0f} MB during capture (< {threshold:.0f} MB); no rise was "
+                "caught, so the ranking below reflects memory growth, not the spike. Use duration_sec >= period_sec."
+            )
     high_idx = [i for i, v in enumerate(system) if v >= lo + (hi - lo) / 2] if spike_observed else []
-    result["system_cpu"] = {"min": lo, "max": hi, "spike_observed": spike_observed}
-    if not spike_observed:
-        result["notes"].append(
-            f"system CPU varied only {hi - lo:.0f} points during capture; no spike was caught, so the "
-            "ranking below reflects average load, not the spike. Re-run timed with next_peak_eta_sec."
-        )
 
-    # Per process (pid+name, so a reused pid is a different row) and per name (multi-process programs).
-    keys = {(pid, p.name) for s in snaps for pid, p in s.procs.items()}
+    # 5. Rank. One row per (pid, name) so a reused pid is a different row, except programs that were
+    #    restarted with a new pid: those are merged into one row per name. Concurrent same-name
+    #    processes are also summed into top_process_groups.
+    lifecycles = _lifecycles(snaps)
+    respawned = {n for n, lc in lifecycles.items() if lc["respawned"]}
     rows = []
-    for pid, name in keys:
-        series = [s.procs[pid].cpu if pid in s.procs and s.procs[pid].name == name else 0.0 for s in snaps]
+    for pid, name in {(pid, p.name) for s in snaps for pid, p in s.procs.items() if p.name not in respawned}:
+        series = [_proc_value(s.procs[pid], metric) if pid in s.procs and s.procs[pid].name == name else 0.0
+                  for s in snaps]
         if max(series) <= 0:
             continue
         latest = next((s.procs[pid] for s in reversed(snaps) if pid in s.procs and s.procs[pid].name == name), None)
         rows.append({"pid": pid, "name": name, "owner": latest.owner if latest else None,
-                     **_stats(series, system, high_idx)})
+                     **_stats(series, system, high_idx, metric)})
 
     by_name: dict[str, list[float]] = {}
-    counts: dict[str, set[int]] = {}
     for idx, s in enumerate(snaps):
         for p in s.procs.values():
-            by_name.setdefault(p.name, [0.0] * len(snaps))[idx] += p.cpu
-            counts.setdefault(p.name, set()).add(p.pid)
+            by_name.setdefault(p.name, [0.0] * len(snaps))[idx] += _proc_value(p, metric)
+    for name in respawned:
+        series = by_name[name]
+        if max(series) <= 0:
+            continue
+        latest = next(p for s in reversed(snaps) for p in s.procs.values() if p.name == name)
+        rows.append({"pid": latest.pid, "pids_seen": lifecycles[name]["pids_seen"], "name": name,
+                     "owner": latest.owner, **_stats(series, system, high_idx, metric),
+                     # listed at all, not "using > 0" (a run that just started holds ~0 MB)
+                     "present_ratio": lifecycles[name]["present_ratio"]})
     groups = [
-        {"name": n, "instances": len(counts[n]), **_stats(series, system, high_idx)}
+        {"name": n, "instances": len(lifecycles[n]["pids_seen"]), **_stats(series, system, high_idx, metric)}
         for n, series in by_name.items()
-        if len(counts[n]) > 1 and max(series) > 0
+        if lifecycles[n]["max_concurrent"] > 1 and max(series) > 0
     ]
 
-    sort_key = (lambda r: (r["avg_cpu_during_spike"] or 0, r["correlation"] or 0)) if spike_observed \
-        else (lambda r: (r["avg_cpu"], r["correlation"] or 0))
-    rows.sort(key=sort_key, reverse=True)
-    groups.sort(key=sort_key, reverse=True)
+    score = _SPIKE_KEY[metric] if spike_observed else _CALM_KEY[metric]
+    avg = _AVG_KEY[metric]
+
+    def rank(r: dict) -> tuple:
+        # ties broken by average usage, then name/pid, so the order is stable across runs
+        return (-(r[score] or 0), -(r["correlation"] or 0), -(r[avg] or 0), r["name"], r.get("pid", 0))
+
+    rows.sort(key=rank)
+    groups.sort(key=rank)
     result["top_processes"] = rows[:top_n]
     result["top_process_groups"] = groups[:top_n]
 
-    # Name a suspect only when the evidence is clear.
+    # 6. Name a suspect only when the evidence is clear.
     suspect = None
     if spike_observed and rows:
+        hs = set(high_idx)
+        sys_high = _mean([system[i] for i in high_idx]) or 0.0
+        sys_low = _mean([v for i, v in enumerate(system) if i not in hs])
+        # What one process must explain: the spike level for CPU, the rise above the quiet level for memory.
+        ref = sys_high if metric == "cpu" else sys_high - (sys_low if sys_low is not None else sys_high)
         best = rows[0]
-        spike_sys = sum(system[i] for i in high_idx) / len(high_idx)
         best_group = groups[0] if groups else None
-        if best_group and (best_group["avg_cpu_during_spike"] or 0) > 1.5 * (best["avg_cpu_during_spike"] or 0) \
+        if best_group and (best_group[score] or 0) > 1.5 * (best[score] or 0) \
                 and (best_group["correlation"] or 0) >= 0.6:
             suspect = {"type": "process_group", "name": best_group["name"],
                        "instances": best_group["instances"],
                        "reason": "several processes with the same name together drive the spikes; "
                                  "killing one pid may not stop it"}
-        elif (best["correlation"] or 0) >= 0.6 and (best["avg_cpu_during_spike"] or 0) >= 0.3 * spike_sys:
-            suspect = {"type": "process", "pid": best["pid"], "name": best["name"],
-                       "reason": f"its CPU tracks system CPU (r={best['correlation']}) and accounts for "
-                                 f"~{best['avg_cpu_during_spike']}% during spikes"}
+        elif (best["correlation"] or 0) >= 0.6 and (best[score] or 0) >= 0.3 * ref:
+            if metric == "cpu":
+                reason = (f"its CPU tracks system CPU (r={best['correlation']}) and accounts for "
+                          f"~{best['avg_cpu_during_spike']}% during spikes")
+            else:
+                reason = (f"its memory tracks system memory (r={best['correlation']}) and accounts for "
+                          f"~{best['spike_delta_mb']:.0f} MB of the ~{ref:.0f} MB rise during spikes")
+            suspect = {"type": "process", "pid": best["pid"], "name": best["name"], "reason": reason}
+            if "pids_seen" in best:
+                suspect["pids_seen"] = best["pids_seen"]
+        if suspect:
+            lc = lifecycles[suspect["name"]]
+            hint = _recurrence_hint(lc)
+            if hint:
+                suspect["lifecycle"] = lc
+                suspect["recurrence_hint"] = hint
+
+        if metric == "memory" and ref > 0:
+            # The agent may not report every process (e.g. system services): say how much is unexplained.
+            # rows cover every listed pid (groups would double count them)
+            explained = sum(max(0.0, r["spike_delta_mb"] or 0.0) for r in rows)
+            ratio = explained / ref
+            result["system_memory"]["spike_rise_mb"] = round(ref)
+            result["system_memory"]["explained_by_listed_processes"] = round(min(ratio, 9.99), 2)
+            if ratio < 0.5:
+                result["notes"].append(
+                    f"system memory rose ~{ref:.0f} MB during spikes but the listed processes account for only "
+                    f"~{explained:.0f} MB. The cause may be a process the agent does not report (e.g. a system "
+                    "service) or kernel/driver memory."
+                )
     result["suspect"] = suspect
     if suspect is None and spike_observed:
         result["notes"].append("no single process clearly explains the spikes; review top_processes manually.")
     return result
-
-
-# --------------------------------------------------------------------------
-# request_kill_process / confirm_kill_process
-# --------------------------------------------------------------------------
-
-
-async def request_kill_process(deps: Deps, did: int, pid: int, name: str, reason: str = "") -> dict:
-    if pid in PROTECTED_PIDS or name.strip().lower() in deps.settings.protected_processes:
-        raise ToolError(f"refused: '{name}' (pid {pid}) is a protected system/agent process and cannot be killed.")
-    dev = await get_device_checked(deps, did, require_plugin=PROCESS_PLUGIN)
-    _require_online(dev)
-    snap = await _fresh_process_list(deps, dev, keep_alive_sec=deps.confirm.ttl_sec)
-    proc = snap.procs.get(pid)
-    if proc is None:
-        raise ToolError(f"pid {pid} is not running on device {did}; it may have exited. Capture again.")
-    if not _same_name(proc.name, name):
-        raise ToolError(f"pid {pid} is now '{proc.name}', not '{name}'. The pid may have been reused; capture again.")
-    if proc.name.strip().lower() in deps.settings.protected_processes:
-        raise ToolError(f"refused: '{proc.name}' is a protected system/agent process.")
-
-    summary = {
-        "device": {"did": did, "name": dev.get("name")},
-        "process": {"pid": pid, "name": proc.name, "owner": proc.owner, "cpu_now": proc.cpu,
-                    "mem_mb": round(proc.mem_kb / 1024, 1) if proc.mem_kb else None},
-        "system_cpu_now": snap.system_cpu,
-        "reason": reason or None,
-    }
-    token = deps.confirm.issue(KILL_ACTION, {"did": did, "pid": pid, "name": proc.name}, summary)
-    log.info("kill requested did=%s pid=%s name=%s reason=%r", did, pid, proc.name, reason)
-    return {
-        "confirm_token": token,
-        "expires_in_sec": deps.confirm.ttl_sec,
-        "summary": summary,
-        "instruction": (
-            "Nothing has been killed. Show this summary to the user and ask for explicit confirmation. "
-            "Call confirm_kill_process with this token ONLY after the user agrees; if they decline, do nothing."
-        ),
-    }
-
-
-async def confirm_kill_process(deps: Deps, confirm_token: str, verify_timeout_sec: int = 30) -> dict:
-    try:
-        pending = deps.confirm.consume(confirm_token, KILL_ACTION)
-    except KeyError as ex:
-        raise ToolError(f"{ex.args[0]}. Call request_kill_process again.") from ex
-    did, pid, name = pending.params["did"], pending.params["pid"], pending.params["name"]
-    base = {"device": pending.summary.get("device"), "pid": pid, "name": name}
-    verify_timeout_sec = max(5, min(verify_timeout_sec, 120))
-
-    dev = await get_device_checked(deps, did, require_plugin=PROCESS_PLUGIN)
-    _require_online(dev)
-    # Never kill based on stale data: re-check against a fresh process list.
-    try:
-        snap = await _fresh_process_list(deps, dev, keep_alive_sec=verify_timeout_sec + 60)
-    except ToolError as ex:
-        log.warning("kill aborted (no fresh data) did=%s pid=%s: %s", did, pid, ex)
-        return {**base, "status": "aborted_no_fresh_data", "killed": False, "detail": str(ex)}
-    proc = snap.procs.get(pid)
-    if proc is None:
-        log.info("kill skipped (already exited) did=%s pid=%s", did, pid)
-        return {**base, "status": "already_exited", "killed": False}
-    if not _same_name(proc.name, name):
-        log.warning("kill aborted (pid reused) did=%s pid=%s expected=%s actual=%s", did, pid, name, proc.name)
-        return {**base, "status": "aborted_pid_reused", "killed": False,
-                "detail": f"pid {pid} now belongs to '{proc.name}'. Nothing was killed."}
-
-    cpu_before = snap.system_cpu
-    try:
-        resp = await deps.client.kill_processes(did, [pid])
-    except DeviceOnError as ex:
-        log.error("kill failed did=%s pid=%s: %s", did, pid, ex)
-        return {**base, "status": "kill_failed", "killed": False, "detail": str(ex)}
-    log.info("kill sent did=%s pid=%s name=%s response=%s", did, pid, name, resp)
-    if resp.get("result") is False:
-        return {**base, "status": "kill_failed", "killed": False, "detail": resp}
-
-    # Verify only on full snapshots newer than the one we checked: a snapshot without
-    # a process list says nothing about whether the pid is gone.
-    waited, gone, last = 0.0, False, snap
-    while waited < verify_timeout_sec:
-        await deps.sleep(POLL_SEC)
-        waited += POLL_SEC
-        s = await _read(deps, dev)
-        if not s.has_list or not _newer(s, last.ts_ms):
-            continue
-        last = s
-        p = s.procs.get(pid)
-        if p is None or not _same_name(p.name, name):
-            gone = True
-            break
-
-    return {
-        **base,
-        "status": "killed" if gone else "kill_sent_unverified",
-        "killed": gone,
-        "system_cpu_before": cpu_before,
-        "system_cpu_after": last.system_cpu if last is not snap else None,
-        "next_step_hint": (
-            "Spikes are periodic, so a low reading right now proves little. Re-run "
-            "analyze_metric_periodicity after at least one full period to confirm they stopped."
-            if gone else
-            f"No fresh process list showed the pid gone within {verify_timeout_sec}s. Check again later."
-        ),
-    }

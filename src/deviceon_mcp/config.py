@@ -38,6 +38,11 @@ class Settings:
     temp_sensor: str | None = None
     # Process names (case-insensitive) that may never be killed through this server
     protected_processes: frozenset[str] = field(default_factory=frozenset)
+    # Second switch for toolset 'remote' (AI-written scripts run on devices). Off by default.
+    allow_remote_command: bool = False
+    # YOLO mode: action names (e.g. "run_command", "kill_process") or "all" whose request_* tool
+    # executes immediately instead of returning a confirm token. Empty = always ask (default).
+    auto_confirm: frozenset[str] = field(default_factory=frozenset)
 
     @staticmethod
     def from_env() -> "Settings":
@@ -68,6 +73,10 @@ class Settings:
             temp_plugin=os.environ.get("DEVICEON_TEMP_PLUGIN") or None,
             temp_sensor=os.environ.get("DEVICEON_TEMP_SENSOR") or None,
             protected_processes=frozenset(DEFAULT_PROTECTED_PROCESSES | extra_protected),
+            allow_remote_command=_bool("DEVICEON_ALLOW_REMOTE_COMMAND", False),
+            auto_confirm=frozenset(
+                a.strip().lower() for a in os.environ.get("DEVICEON_AUTO_CONFIRM", "").split(",") if a.strip()
+            ),
         )
 
 

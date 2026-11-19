@@ -7,7 +7,7 @@ from deviceon_mcp.config import DEFAULT_PROTECTED_PROCESSES, Settings
 from deviceon_mcp.confirm_store import ConfirmStore
 from deviceon_mcp.deps import Deps
 
-from fake_deviceon import FakeDeviceOn
+from fake_deviceon import FakeDeviceOn, FakeTerminal
 
 
 def make_settings(**kw) -> Settings:
@@ -30,6 +30,7 @@ def fake() -> FakeDeviceOn:
 async def deps(fake: FakeDeviceOn):
     settings = make_settings()
     client = DeviceOnClient(settings, transport=fake.transport())
-    d = Deps(settings=settings, client=client, confirm=ConfirmStore(300), sleep=fake.sleep, now_ms=fake.now_ms)
+    d = Deps(settings=settings, client=client, confirm=ConfirmStore(300), sleep=fake.sleep, now_ms=fake.now_ms,
+             terminal=FakeTerminal(fake))
     yield d
     await client.aclose()

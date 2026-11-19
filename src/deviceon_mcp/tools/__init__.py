@@ -11,12 +11,16 @@ from typing import Callable
 
 from mcp.server.fastmcp import FastMCP
 
+from ..actions import check_auto_confirm
 from ..deps import Deps
-from . import common, diagnose
+from . import common, control, diagnose, logs, remote
 
 TOOLSETS: dict[str, Callable[[FastMCP, Deps], None]] = {
     "common": common.register,
     "diagnose": diagnose.register,
+    "control": control.register,
+    "logs": logs.register,
+    "remote": remote.register,  # also needs DEVICEON_ALLOW_REMOTE_COMMAND=true
 }
 
 
@@ -28,4 +32,7 @@ def register_toolsets(mcp: FastMCP, deps: Deps, names: tuple[str, ...]) -> list[
     ordered = ["common"] + [n for n in names if n != "common"]
     for name in ordered:
         TOOLSETS[name](mcp, deps)
+    if deps.actions:  # some toolset registered request_* tools that need step 2
+        common.register_confirm_action(mcp, deps)
+    check_auto_confirm(deps)
     return ordered

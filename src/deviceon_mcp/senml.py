@@ -44,6 +44,30 @@ def flatten_sensors(handler_obj: dict) -> dict[str, Any]:
     return out
 
 
+def flatten_sensor_meta(handler_obj: dict) -> dict[str, dict[str, Any]]:
+    """Like flatten_sensors, but keeps each sensor's access mode.
+
+    Returns {"/Group/Name": {"value": ..., "asm": "r" | "rw" | "w" | None}}. The access mode
+    comes from the entry's "asm" or, failing that, the nearest enclosing group's "basm".
+    """
+    out: dict[str, dict[str, Any]] = {}
+
+    def walk(obj: dict, prefix: str, inherited: str | None) -> None:
+        group_asm = obj.get("basm") or inherited
+        for item in obj.get("e") or []:
+            if isinstance(item, dict) and "n" in item:
+                asm = item.get("asm") or group_asm
+                out[f"{prefix}/{item['n']}"] = {"value": entry_value(item), "asm": str(asm).lower() if asm else None}
+        for key, val in obj.items():
+            if key in _SKIP_KEYS or key == "e":
+                continue
+            if isinstance(val, dict):
+                walk(val, f"{prefix}/{val.get('bn') or key}", group_asm)
+
+    walk(handler_obj or {}, "", None)
+    return out
+
+
 def to_number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None

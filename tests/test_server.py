@@ -8,20 +8,43 @@ from deviceon_mcp.tools import register_toolsets
 
 ALL = {
     "list_devices", "analyze_metric_periodicity", "get_current_metrics",
-    "capture_top_processes", "request_kill_process", "confirm_kill_process",
+    "capture_top_processes", "find_unresponsive_windows",
 }
 
 
-async def test_all_toolsets_register_six_tools(deps):
+async def test_diagnose_toolset_is_read_only(deps):
     mcp = FastMCP("t")
     register_toolsets(mcp, deps, ("common", "diagnose"))
     tools = {t.name: t for t in await mcp.list_tools()}
     assert set(tools) == ALL
-    assert tools["confirm_kill_process"].annotations.destructiveHint is True
+    assert all(t.annotations.readOnlyHint for t in tools.values())  # diagnose is read-only
     assert tools["analyze_metric_periodicity"].annotations.readOnlyHint is True
     # Context parameter must not leak into the schema the LLM sees
     assert "ctx" not in tools["capture_top_processes"].inputSchema["properties"]
-    assert tools["confirm_kill_process"].inputSchema["required"] == ["confirm_token"]
+
+
+CONTROL = {
+    "get_device_capabilities", "take_screenshot", "request_kill_process", "request_power_action", "request_set_data",
+    "request_kvm_session", "request_protection_action", "request_recovery_action", "confirm_action",
+}
+
+
+async def test_control_toolset_adds_confirm_action(deps):
+    mcp = FastMCP("t")
+    register_toolsets(mcp, deps, ("control",))
+    tools = {t.name: t for t in await mcp.list_tools()}
+    assert set(tools) == CONTROL | {"list_devices"}
+    assert tools["confirm_action"].annotations.destructiveHint is True
+    assert tools["confirm_action"].inputSchema["required"] == ["confirm_token"]
+    # every step-1 tool is read-only: it must never change device state
+    assert all(tools[n].annotations.readOnlyHint for n in CONTROL if n.startswith("request_"))
+
+
+async def test_entry_point_tools_skip_deferred_loading(deps):
+    mcp = FastMCP("t")
+    register_toolsets(mcp, deps, ("common", "diagnose", "control"))
+    always = {t.name for t in await mcp.list_tools() if (t.meta or {}).get("anthropic/alwaysLoad")}
+    assert always == {"list_devices", "get_device_capabilities", "confirm_action"}
 
 
 async def test_toolset_filter_exposes_only_common(deps):

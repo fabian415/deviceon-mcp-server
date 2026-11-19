@@ -1,8 +1,8 @@
 """Single-use, expiring confirmation tokens for destructive actions.
 
-request_kill_process issues a token; confirm_kill_process consumes it. Because the
-kill tool only accepts a token (not a pid), the agent cannot kill anything without
-first going through the request step that tells it to ask the user.
+request_* tools issue a token; confirm_action consumes it. Because the confirm tool only
+accepts a token (not the action's parameters), the agent cannot act without first going
+through the request step that tells it to ask the user.
 
 In-memory only: tokens die with the process, which is the safe default for a PoC.
 """
@@ -52,6 +52,22 @@ class ConfirmStore:
             item = self._items.get(token)
             if item is None or item.action != action:
                 raise KeyError("confirm_token is unknown, already used, or expired")
+            del self._items[token]
+            return item
+
+    def consume_any(self, token: str, allowed: set[str] | frozenset[str]) -> PendingAction:
+        """Like consume() but accepts any action type in `allowed` (generic confirm_action tool).
+
+        A token of another type is left untouched so its own confirm tool can still use it.
+        """
+        now = self._clock()
+        with self._lock:
+            self._purge(now)
+            item = self._items.get(token)
+            if item is None:
+                raise KeyError("confirm_token is unknown, already used, or expired")
+            if item.action not in allowed:
+                raise KeyError(f"confirm_token belongs to '{item.action}', which has its own confirm tool")
             del self._items[token]
             return item
 

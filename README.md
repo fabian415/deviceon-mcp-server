@@ -15,9 +15,26 @@ AI Agent (OpenClaw)  ──MCP──▶  DeviceOn MCP Server  ──REST /rmm/v1
 | common | `list_devices` | 讀 | `GET /v1/devicegroups/devices` |
 | diagnose | `analyze_metric_periodicity` | 讀 | `GET /v1/devices/{did}`、`GET /v1/data/devices/{did}/histdata` |
 | diagnose | `get_current_metrics` | 讀 | `GET /v1/data/devices/{did}/latestdata?source=autoreport` |
-| diagnose | `capture_top_processes` | 讀 | `PUT /v1/devicectrl/intermittent_report` + `GET /v1/data/devices/{did}/latestdata`（取樣多次） |
-| diagnose | `request_kill_process` | 讀（只發 token） | 同上（取一份最新的 process 清單） |
-| diagnose | `confirm_kill_process` | **寫（破壞性）** | 同上 + `PUT /v1/processes`（`action: kill`） |
+| diagnose | `capture_top_processes`（`metric`: `cpu` / `memory`） | 讀 | `PUT /v1/devicectrl/intermittent_report` + `GET /v1/data/devices/{did}/latestdata`（取樣多次） |
+| diagnose | `find_unresponsive_windows` | 讀 | 遠端執行固定的唯讀檢查（使用者 session，見[遠端執行](#遠端執行是怎麼做的)） |
+| control | `request_kill_process` | 讀（只發 token） | `intermittent_report` + `latestdata`（取一份最新的 process 清單）→ 確認後 `PUT /v1/processes`（`action: kill`） |
+| control | `get_device_capabilities` | 讀 | `GET /v1/devices/{did}`、`/v1/power/devices/{did}`、`/v1/protection/…`、`/v1/recovery/…`、`/v1/devlog` |
+| control | `take_screenshot` | 讀（回傳圖片） | `GET /v1/screenshot/devices/{did}?resType=base64` |
+| control | `request_power_action` | 讀（只發 token） | `GET /v1/power/devices/{did}` → 確認後 `PUT /v1/power/device` |
+| control | `request_set_data` | 讀（只發 token） | `latestdata`（讀目前值與 asm）→ 確認後 `PUT /v1/devicectrl/data` |
+| control | `request_kvm_session` | 讀（只發 token） | 確認後 `POST /v1/kvm`，回傳連線資訊給**人**（只能用 Portal 的瀏覽器 noVNC 開，不支援 UltraVNC） |
+| control | `request_protection_action` | 讀（只發 token） | `GET /v1/protection/devices/{did}` → 確認後 `PUT /v1/protection/device` |
+| control | `request_recovery_action` | 讀（只發 token） | `GET /v1/recovery/devices/{did}` → 確認後 `PUT /v1/recovery/device` |
+| logs | `fetch_device_log` | 讀 | 預設：遠端終端機執行固定的 `Get-WinEvent` 查詢；`source=devlog`：`/v1/devlog/requests` |
+| remote | `request_run_command` | 讀（只發 token） | 確認後經遠端終端機（SYSTEM）或 Launch Remote Process（使用者） |
+| （自動） | `confirm_action` | **寫（破壞性）** | 執行任何 `request_*` 準備好的動作（包括 kill） |
+
+- `diagnose` 是**純唯讀**；所有會改變裝置的動作（包括 kill）都在 `control`／`remote`，一律經過 `confirm_action`。只開 `common,diagnose` 的部署不能 kill。
+- `confirm_action` 只在開啟了 `control` 或 `remote` 這類會改變裝置狀態的 toolset 時才會出現。
+- **延後載入**：Claude Code 和 OpenClaw 預設只先給模型 tool 名稱，用到時才載入完整定義，所以 tool 變多也不會每輪吃掉大量 token。`list_devices`、`get_device_capabilities`、`confirm_action` 是幾乎每個任務都會用到的入口，標了 `_meta["anthropic/alwaysLoad"]`，在 Claude Code 會預先載入、省一次搜尋。toolset 的用途是**讓管理者決定這個環境能做什麼**，不是為了省 token。新增 tool 時，名稱維持 `request_`／`get_`／`list_` 等固定開頭，說明第一句用英文寫清楚用途關鍵字（OpenClaw 的搜尋是英文關鍵字比對）。
+- **刻意不做群組操作**（`/power/group`、`/protection/group` 等）：一次確認不應該影響一整群機器。
+- **KVM 只能用瀏覽器開**：`request_kvm_session` 回傳的 port 80 是給 Portal 瀏覽器版 noVNC 用的 web port，不是原生 VNC（RFB）port，**UltraVNC 等原生 VNC viewer 不支援**。使用者要到 DeviceOn Portal 該裝置的 KVM 頁面開啟。
+- **KVM 檔案傳輸沒有實作**：DeviceOn 用瀏覽器端的 WebRTC 傳檔，MCP server 無法扮演瀏覽器。需要時可用 `request_run_command` 讓裝置自己下載。
 
 ### process 清單是怎麼拿到的
 
@@ -34,11 +51,37 @@ AI Agent (OpenClaw)  ──MCP──▶  DeviceOn MCP Server  ──REST /rmm/v1
 
 ### 安全設計
 
-- **兩段式 kill**：`confirm_kill_process` 只接受 `request_kill_process` 發出的 token，不接受 pid。Agent 無法跳過「詢問使用者」這一步。token 只能用一次，預設 5 分鐘後失效，只存在記憶體中。
+- **兩段式 kill**：`confirm_action` 只接受 `request_kill_process` 發出的 token，不接受 pid。Agent 無法跳過「詢問使用者」這一步。token 只能用一次，預設 5 分鐘後失效，只存在記憶體中。
 - **PID 重用保護**：確認 kill 前會重新讀取 process 清單；如果 pid 已經屬於其他程式名稱，就中止並回報 `aborted_pid_reused`。
 - **保護清單**：系統關鍵 process 和 DeviceOn agent 本身（`cagent`、`systemd`、`lsass.exe` 等，見 [config.py](src/deviceon_mcp/config.py)）一律拒絕。可以用 `DEVICEON_PROTECTED_PROCESSES` 擴充。
 - **稽核記錄**：每次 kill 的申請、執行、中止都會寫進 `deviceon_mcp.audit` logger（輸出到 stderr）。DeviceOn 端也會留下 `SetKillPrc` 操作事件。
+- **所有會改變裝置的動作都是兩段式**：`request_*` 只做檢查，回傳摘要、警示和 token（工具標成 readOnly），`confirm_action` 才真的執行。檢查內容依工具而定：開關機比對裝置支援的動作和在線狀態；寫入資料拒絕唯讀或不存在的感測器並列出「目前值 → 新值」；保護／還原檢查軟體是否已安裝、啟用，遠端還原前確認遠端備份存在。
+- **LLM 自己寫的腳本（`remote` toolset）**：要同時設定 `DEVICEON_TOOLSETS` 含 `remote` **和** `DEVICEON_ALLOW_REMOTE_COMMAND=true` 才會開啟。摘要會附上完整腳本；拒絕 `-EncodedCommand`（看不出內容）；對刪除、格式化、關機、停服務、kill、改登錄檔、改帳號、下載、動態執行、改安全設定、提到受保護的 process 等寫法加上警示。腳本上限 2500 字元。
+- **YOLO 模式（`DEVICEON_AUTO_CONFIRM`，預設關閉）**：列出的動作（逗號分隔，或 `all`）在 `request_*` 就直接執行並回傳結果（`auto_confirmed: true`），不發 token、不用 `confirm_action`，適合反覆調整腳本的開發／測試情境。動作名稱：`run_command`、`kill_process`、`power`、`set_data`、`kvm`、`protection`、`recovery`。
+  - 仍然有效的檢查：保護清單、PID 重用、拒絕 `-EncodedCommand`、腳本長度、在線狀態等 request 階段的檢查都照做；稽核記錄會多一行 `action auto-confirmed (YOLO)`。
+  - **命中風險樣式的腳本仍然要確認**：`run_command` 在 YOLO 下只自動執行沒有風險警示的腳本（例如查詢類）；有刪除、停服務、kill 等警示的會照常回傳 token 和 `auto_confirm_skipped`。
+  - 寫錯名稱或該動作所屬的 toolset 沒開，server 會拒絕啟動。開啟後對應的 `request_*` 工具會改標成 destructive，server instructions 也會告訴 Agent 不用先詢問。
+  - 在 Claude Code，`request_*` 已在 `allow`，所以 YOLO 的動作完全不會跳出視窗；`confirm_action` 保留在 `ask`，只有被判定為風險的請求才會用到。建議只在個人環境用 `"DEVICEON_AUTO_CONFIRM": "run_command"`，不要寫進共用的 `.mcp.json`，也不要和 HTTP 模式一起用。
+- **防 prompt injection**：process 名稱、視窗標題、log、截圖、指令輸出都來自裝置，回傳時都標註為不可信資料；server 的 instructions 也要求 Agent 不要照著裝置資料裡的文字行動。
 - **權限**：使用 DeviceOn 帳號呼叫 API，沿用 DeviceOn 原本的角色和裝置群組權限。建議建立專用的服務帳號，只授予 `GetData`、`GetSensor`（`intermittent_report` 需要）、`GetProcess`、`EditProcess` 權限，以及目標裝置群組。
+
+### 遠端執行是怎麼做的
+
+已在實機（Windows 10 agent，2026-11）驗證。DeviceOn 有兩個能在裝置上執行東西的管道，各有限制，所以依「要用誰的身分執行」選擇：
+
+| `run_as` | 管道 | 身分 | 輸出怎麼回來 | 速度 |
+|---|---|---|---|---|
+| `system`（預設） | 遠端終端機 websocket `wss://<host>/terminal/<basic>/<agentId>/<uuid>`（**沒有 `/rmm`**，網址取自 Portal 的 `WebShell.js`） | `NT AUTHORITY\SYSTEM`，session 0 | 直接回傳 | 約 1 秒 |
+| `user` | ① 終端機把腳本寫到 `C:\ProgramData\DeviceOnMCP\<id>.ps1` ② `POST /v1/processes`（Launch Remote Process）用 `-File` 執行 ③ 腳本把輸出寫進 Application 事件記錄（`WScript.Shell.LogEvent`，來源 WSH，帶 `<id>`）④ 終端機讀回事件並刪除腳本 | 登入的使用者，session 1 | 經事件記錄 | 約 3 秒 |
+
+- **為什麼需要 `user`**：`Process.Responding` 只看得到同一個桌面的視窗。實測同一個卡死的 `hang_app.exe`，SYSTEM 看到的是 `Responding=True`（誤判），使用者 session 看到的是 `False`。
+- **實測到的限制**：
+  - Launch Remote Process 的 `arg` 超過約 260 字元會失敗，Portal 只回 `{"result": false}`，不說原因；它也不會回傳輸出。所以只用它啟動已寫好的 `.ps1`。
+  - 終端機的單一 websocket 訊息超過約 8 KB，伺服器會以 1009 斷線，所以命令列上限 7500 字元、腳本上限 2500 字元。
+  - 終端機轉送的是 cmd.exe 的輸出（OEM 字碼頁），中文會變成 `?`。PowerShell 的輸出一律先轉成 UTF-8 再用 base64 傳回。
+  - PowerShell 第一次載入模組時會在 stderr 印出 CLIXML 進度訊息，已用 `$ProgressPreference='SilentlyContinue'` 關掉，解析時也會濾掉。
+- **DeviceOn 的 Device Log（`/v1/devlog/requests`）在測試伺服器上不能用**：agent 每次都回 `500:Copyfile fail : Syntax or usage error (&d)`，應該是 Portal 的 Device Log 遠端儲存設定有問題，需要管理者檢查。所以 `fetch_device_log` 預設改用終端機查詢，`source=devlog` 保留為備用（檔案格式尚未驗證）。
+- 使用者 session 的執行結果會留在裝置的 Application 事件記錄裡（來源 WSH），本機使用者看得到。
 
 ## 程式結構
 
@@ -50,15 +93,24 @@ src/deviceon_mcp/
 ├── senml.py            # 解析 DeviceOn 的 {"bn", "e": [{"n","v"}]} 資料格式
 ├── analysis.py         # 週期偵測、相關係數（純 Python）
 ├── confirm_store.py    # 一次性確認 token
-├── deps.py             # 共用依賴（client、clock、sleep，方便測試注入）
+├── actions.py          # 共用的兩段式動作：issue_action / confirm_action
+├── terminal.py         # DeviceOn 遠端終端機 websocket client
+├── remote_exec.py      # 遠端執行（SYSTEM / 使用者 session）、腳本審查
+├── deps.py             # 共用依賴（client、terminal、clock、sleep，方便測試注入）
 └── tools/
-    ├── __init__.py     # TOOLSETS 註冊表
-    ├── common/         # list_devices
-    └── diagnose/       # metrics.py、processes.py
+    ├── __init__.py     # TOOLSETS 註冊表（有需要確認的動作時自動加上 confirm_action）
+    ├── common/         # list_devices、confirm_action
+    ├── diagnose/       # metrics.py、processes.py、windows.py
+    ├── control/        # capabilities、power、screenshot、data、kvm、protect
+    ├── logs/           # eventlog.py
+    └── remote/         # command.py
 simulator/
 ├── windows/            # cpu_hog.exe（C#，build.bat 以內建 .NET Framework 4 編譯）
 ├── windows-task/       # mem_leak.exe + install.ps1 / uninstall.ps1（工作排程器觸發的記憶體暴增）
+├── windows-hang/       # hang_app.exe（WinForms 視窗死結 →「沒有回應」，CPU≈0%、記憶體平穩）
 └── stress_sim.py       # Linux 用的 Python 版
+scripts/
+└── probe_process_fields.py  # 直接看 agent 回報的原始 process 欄位（例如 IsActive）
 tests/                  # 包含模擬的 DeviceOn 後端（fake_deviceon.py）
 ```
 
@@ -88,7 +140,7 @@ python -m venv .venv
 標準做法：MCP 設定放在 repo 根目錄的 `.mcp.json`（進版控、團隊共用），帳號密碼放在每位成員自己的 Windows 使用者環境變數（不進版控）。
 
 ```
-Windows 使用者環境變數 ──(Claude Code 啟動時展開 ${VAR})──▶ .mcp.json 的 env ──▶ deviceon-mcp.exe 子程序
+Windows 使用者環境變數 ──(Claude Code 啟動時展開 ${VAR})──▶ .mcp.json 的 env ──▶ python -m deviceon_mcp 子程序
 ```
 
 **步驟 1：設定使用者環境變數（每位成員做一次）**
@@ -98,7 +150,7 @@ setx DEVICEON_BASE_URL "https://deviceon.wise-paas.com/rmm"
 setx DEVICEON_USERNAME "root@advantech.com.tw"
 setx DEVICEON_PASSWORD "2022AdvP@ssw0rd"
 # 選用：venv 不在預設路徑 E:/workspace/DeviceOn/Backend/mcp-server 時才需要
-setx DEVICEON_MCP_EXE "E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/deviceon-mcp.exe"
+setx DEVICEON_MCP_PYTHON "E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/python.exe"
 ```
 
 **步驟 2：完全關閉並重新開啟 VS Code**（或終端機）。`setx` 只對之後新啟動的程式生效，Claude Code 是在啟動時展開 `${VAR}` 的。開一個新的 PowerShell 確認：
@@ -114,13 +166,13 @@ echo $env:DEVICEON_BASE_URL     # 應顯示剛才設定的網址
   "mcpServers": {
     "deviceon": {
       "type": "stdio",
-      "command": "${DEVICEON_MCP_EXE:-E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/deviceon-mcp.exe}",
-      "args": [],
+      "command": "${DEVICEON_MCP_PYTHON:-E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/python.exe}",
+      "args": ["-m", "deviceon_mcp"],
       "env": {
         "DEVICEON_BASE_URL": "${DEVICEON_BASE_URL}",
         "DEVICEON_USERNAME": "${DEVICEON_USERNAME}",
         "DEVICEON_PASSWORD": "${DEVICEON_PASSWORD}",
-        "DEVICEON_TOOLSETS": "common,diagnose"
+        "DEVICEON_TOOLSETS": "common,diagnose,control,logs"
       }
     }
   }
@@ -146,10 +198,20 @@ echo $env:DEVICEON_BASE_URL     # 應顯示剛才設定的網址
       "mcp__deviceon__analyze_metric_periodicity",
       "mcp__deviceon__get_current_metrics",
       "mcp__deviceon__capture_top_processes",
-      "mcp__deviceon__request_kill_process"
+      "mcp__deviceon__find_unresponsive_windows",
+      "mcp__deviceon__get_device_capabilities",
+      "mcp__deviceon__request_kill_process",
+      "mcp__deviceon__take_screenshot",
+      "mcp__deviceon__fetch_device_log",
+      "mcp__deviceon__request_power_action",
+      "mcp__deviceon__request_set_data",
+      "mcp__deviceon__request_kvm_session",
+      "mcp__deviceon__request_protection_action",
+      "mcp__deviceon__request_recovery_action",
+      "mcp__deviceon__request_run_command"
     ],
     "ask": [
-      "mcp__deviceon__confirm_kill_process"
+      "mcp__deviceon__confirm_action"
     ]
   },
   "env": {
@@ -159,8 +221,58 @@ echo $env:DEVICEON_BASE_URL     # 應顯示剛才設定的網址
 ```
 
 - 讀取類工具自動放行，Demo 時不會一直跳出確認視窗。
-- `confirm_kill_process` 一律詢問：就算 Agent 誤以為使用者已經同意，Claude Code 也會再跳出確認視窗。加上 server 端的 token 機制，總共有兩道關卡。
+- `confirm_action` 一律詢問：就算 Agent 誤以為使用者已經同意，Claude Code 也會再跳出確認視窗。加上 server 端的 token 機制，總共有兩道關卡。
+- `request_*` 可以放行，因為它們只回傳摘要和 token，不會改變裝置。
+- 要開啟 control／logs／remote，在 `.mcp.json` 的 env 設 `"DEVICEON_TOOLSETS": "common,diagnose,control,logs"`；`remote` 另外要加 `"DEVICEON_ALLOW_REMOTE_COMMAND": "true"`。
 - `MCP_TOOL_TIMEOUT`（毫秒）：`capture_top_processes` 最長會執行 600 秒，設為 11 分鐘可以避免工具執行到一半被中斷。
+
+### （選用）YOLO 模式：跳過確認
+
+讓 LLM 反覆調整、試跑指令時，不用每次都經過「`request_*` → 詢問使用者 → `confirm_action`」。設計與限制見[安全設計](#安全設計)的 YOLO 模式說明。
+
+**開啟後的差別**
+
+| | 一般模式 | YOLO 模式（列在 `DEVICEON_AUTO_CONFIRM` 的動作） |
+|---|---|---|
+| `request_*` | 只檢查，回傳摘要和 `confirm_token` | 檢查後**直接執行**，回傳結果與 `auto_confirmed: true` |
+| Agent 是否先問使用者 | 要 | 不用，但執行後要說明做了什麼 |
+| `confirm_action` | 每次都要 | 不需要；只有被判定為風險的請求（回傳 `auto_confirm_skipped`）才會用到 |
+| Claude Code 確認視窗 | `confirm_action` 每次跳出 | 不跳出（`request_*` 在 `allow`）；風險請求仍會跳出 |
+
+**步驟 1：在共用的 `.mcp.json` 的 `env` 加一行**（預設空值等於關閉，可以放心 commit）
+
+```json
+"DEVICEON_AUTO_CONFIRM": "${DEVICEON_AUTO_CONFIRM:-}"
+```
+
+**步驟 2：要用的人在自己的電腦上設定**
+
+```powershell
+setx DEVICEON_AUTO_CONFIRM "run_command"      # 只讓遠端指令免確認（建議）
+# setx DEVICEON_AUTO_CONFIRM "run_command,kill_process"
+# setx DEVICEON_AUTO_CONFIRM "all"            # 全部免確認，包括關機、還原，不建議
+```
+
+可用的名稱：`run_command`、`kill_process`、`power`、`set_data`、`kvm`、`protection`、`recovery`，或 `all`。
+
+**步驟 3：確認列出的動作所屬的 toolset 有開**。例如 `run_command` 需要 `DEVICEON_TOOLSETS` 包含 `remote`，並設定 `DEVICEON_ALLOW_REMOTE_COMMAND=true`；`kill_process`、`power` 等需要 `control`。沒開的話 server 會拒絕啟動。
+
+**步驟 4：完全關閉 VS Code 再重新開啟**（`${VAR}` 是 Claude Code 啟動時展開的，只在 `/mcp` 重新連線不夠）。
+
+**確認是否生效**：用 `claude --debug` 啟動，stderr 會出現：
+
+```
+WARNING deviceon_mcp.audit: YOLO mode: these actions run WITHOUT confirmation: run_command
+```
+
+**關閉**：`setx DEVICEON_AUTO_CONFIRM ""`，再重新啟動 VS Code。
+
+注意事項：
+- `run_command` 在 YOLO 下只自動執行**沒有風險警示**的腳本。腳本裡有刪除、格式化、關機、停服務、kill、改登錄檔、下載、動態執行等寫法時，仍會回傳 token 並跳出確認視窗。
+- 保護清單、PID 重用、拒絕 `-EncodedCommand`、腳本長度、裝置在線等檢查都照做，不會因為 YOLO 而跳過。
+- 每次自動執行都會在稽核記錄留下 `action auto-confirmed (YOLO)`。
+- **不要和 HTTP 模式一起用**：HTTP 端點沒有認證，能連到 port 的人就能直接執行動作。
+- 只在個人的開發／測試環境使用，不要把實際的值寫死在共用的 `.mcp.json`；OpenClaw 正式工單也不要開。
 
 ### 3. 確認連線
 
@@ -184,8 +296,8 @@ OpenClaw 用標準 MCP client 連線即可，不需要修改這個 server。實�
 
 | 欄位 | 值 |
 |---|---|
-| command | `E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/deviceon-mcp.exe` |
-| args | （無） |
+| command | `E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/python.exe` |
+| args | `-m deviceon_mcp` |
 | env | `DEVICEON_BASE_URL`、`DEVICEON_USERNAME` / `DEVICEON_PASSWORD`（或 `DEVICEON_TOKEN`）、`DEVICEON_TOOLSETS` |
 
 帳號資訊沿用 Claude Code 那一節設定的 Windows 使用者環境變數：如果 OpenClaw 的設定支援 `${VAR}` 展開，或啟動子程序時會繼承環境變數，設定檔裡就不需要寫密碼。如果都不支援，才把值直接寫進 OpenClaw 的設定，並確保那個檔案不會進版控。
@@ -196,13 +308,13 @@ OpenClaw 用標準 MCP client 連線即可，不需要修改這個 server。實�
 {
   "mcpServers": {
     "deviceon": {
-      "command": "E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/deviceon-mcp.exe",
-      "args": [],
+      "command": "E:/workspace/DeviceOn/Backend/mcp-server/.venv/Scripts/python.exe",
+      "args": ["-m", "deviceon_mcp"],
       "env": {
         "DEVICEON_BASE_URL": "https://<DeviceOn主機>/rmm",
         "DEVICEON_USERNAME": "mcp-agent@example.com",
         "DEVICEON_PASSWORD": "<密碼>",
-        "DEVICEON_TOOLSETS": "common,diagnose"
+        "DEVICEON_TOOLSETS": "common,diagnose,control,logs"
       }
     }
   }
@@ -214,8 +326,8 @@ OpenClaw 用標準 MCP client 連線即可，不需要修改這個 server。實�
 **在 OpenClaw 端務必確認：**
 
 1. **工具呼叫的 timeout 至少 11 分鐘**，否則 `capture_top_processes` 會被中斷。
-2. **`confirm_kill_process` 需要人工核准。** 如果 OpenClaw 支援依工具設定核准規則，請對這個工具開啟。如果不支援，就只剩 server 端的兩段式 token 這一道關卡；server 的 `instructions` 和工具描述都有要求 Agent 先詢問使用者，但這只靠模型自律。
-3. **依 ServerClaw 的工單類型選擇 toolset**：每種工單用不同的 `DEVICEON_TOOLSETS` 設定啟動（例如診斷工單用 `common,diagnose`）。
+2. **`confirm_action` 需要人工核准。** 如果 OpenClaw 支援依工具設定核准規則，請對這個工具開啟。如果不支援，就只剩 server 端的兩段式 token 這一道關卡；server 的 `instructions` 和工具描述都有要求 Agent 先詢問使用者，但這只靠模型自律。
+3. **依 ServerClaw 的工單類型選擇 toolset**：每種工單用不同的 `DEVICEON_TOOLSETS` 設定啟動（例如只看不動的巡檢工單用 `common,diagnose,logs`；需要排除問題、可能要 kill 或重開機的工單再加上 `control`）。
 
 ## （選用）HTTP 模式
 
@@ -284,7 +396,7 @@ npx @modelcontextprotocol/inspector .venv\Scripts\deviceon-mcp.exe
 
 ### Windows 上要注意的事
 
-- **重新安裝之前，先關掉使用中的 Agent session。** server 執行中時 `deviceon-mcp.exe` 會被佔用，`pip install -e` 會因為無法覆寫檔案而失敗。只改 `.py` 檔沒有這個問題。
+- **用 `python.exe -m deviceon_mcp` 啟動，不要用 `deviceon-mcp.exe`。** server 執行中時 exe 會被鎖住，這時 `pip install -e .` 會在覆寫 exe 時失敗，而且失敗前已經移除了舊的安裝資訊（`site-packages` 裡只剩 `~eviceon_mcp-0.1.0.dist-info`、`__editable__…pth` 不見），下次啟動就會 `ModuleNotFoundError: No module named 'deviceon_mcp'`，Claude Code 顯示 `CONNECTION_CLOSED`。用 python.exe 啟動就不會鎖住 exe。已經壞掉時：關掉所有使用 deviceon 的 Claude Code session，再執行一次 `pip install -e .`。
 - **查看 server 的 log**：用 `claude --debug` 啟動 Claude Code，MCP Server 的 stderr 會一起顯示。也可以在終端機直接執行 `deviceon-mcp.exe`，看啟動時的錯誤訊息。
 - **確認 token 存在記憶體中**，重新連線後會全部失效。如果在 `request_kill_process` 之後才重新連線，要重新申請 token。
 
@@ -292,6 +404,7 @@ npx @modelcontextprotocol/inspector .venv\Scripts\deviceon-mcp.exe
 
 | 現象 | 可能原因 | 處理方式 |
 |---|---|---|
+| `/mcp` 顯示 `CONNECTION_CLOSED`，直接啟動時出現 `No module named 'deviceon_mcp'` | `pip install -e .` 在 exe 被鎖住時失敗，安裝只剩一半 | 見[Windows 上要注意的事](#windows-上要注意的事) |
 | `claude mcp list` 顯示 Failed | exe 路徑錯誤，或缺少必填的環境變數 | 直接執行 `deviceon-mcp.exe`，看 stderr 的錯誤訊息（例如 `DEVICEON_BASE_URL is required`） |
 | 錯誤訊息提到變數未設定，但明明已經 `setx` 過 | VS Code 是在 `setx` 之前開啟的，讀不到新的值 | 完全關閉 VS Code（包括所有視窗）再重新開啟；用新的 PowerShell 執行 `echo $env:DEVICEON_BASE_URL` 確認 |
 | 放了 `mcp-server/.env` 但沒有作用 | Server 不讀 `.env` 檔 | 改用 `setx` 設定環境變數 |
@@ -303,6 +416,8 @@ npx @modelcontextprotocol/inspector .venv\Scripts\deviceon-mcp.exe
 | 分析結果出現 `too coarse` | 回報 interval 太長 | 把裝置的回報 interval 調到 10 秒以下 |
 | `unique_snapshots` 太少 | Portal 端快取了 process 清單 | 加長 `duration_sec` |
 | `capture_top_processes` 中途逾時 | Agent 端的工具 timeout 太短 | Claude Code 檢查 `MCP_TOOL_TIMEOUT` 後重新啟動；OpenClaw 調整它的工具 timeout |
+| 啟動失敗，訊息是 `DEVICEON_AUTO_CONFIRM has unknown or not-enabled action(s)` | YOLO 的動作名稱拼錯，或所屬的 toolset 沒開 | 對照訊息列出的 enabled actions 修正；例如 `run_command` 要開 `remote` 並設 `DEVICEON_ALLOW_REMOTE_COMMAND=true` |
+| 開了 YOLO 還是要確認 | 腳本命中風險樣式（回傳裡有 `auto_confirm_skipped`），或該動作沒列在 `DEVICEON_AUTO_CONFIRM` | 風險腳本本來就要確認；其他情況檢查變數值，並完全重新啟動 VS Code |
 | 修改程式後沒有生效 | 沒有重新連線 | 見[修改 MCP Server 的流程](#修改-mcp-server-的流程)第 4 步 |
 
 ## PoC Demo 步驟
@@ -322,7 +437,7 @@ npx @modelcontextprotocol/inspector .venv\Scripts\deviceon-mcp.exe
      ```
 3. **等 15–20 分鐘**，累積至少 4 個週期的歷史資料。
 4. **對 Agent 說**：「幫我看一下 <裝置名稱> 最近是不是怪怪的」。預期的流程：
-   `list_devices` → `analyze_metric_periodicity`（periodic=true, period≈180s）→ `capture_top_processes`（duration ≥ 180s，suspect=cpu_hog）→ `request_kill_process` → **Agent 詢問使用者** → `confirm_kill_process` → 等一個週期後再跑 `analyze_metric_periodicity` 確認尖峰已消失。
+   `list_devices` → `analyze_metric_periodicity`（periodic=true, period≈180s）→ `capture_top_processes`（duration ≥ 180s，suspect=cpu_hog）→ `request_kill_process` → **Agent 詢問使用者** → `confirm_action` → 等一個週期後再跑 `analyze_metric_periodicity` 確認尖峰已消失。
 
 ### 情境二：工作排程器觸發的記憶體暴增（Windows）
 
@@ -351,8 +466,53 @@ Get-Content $env:LOCALAPPDATA\DeviceOnSim\mem_leak.log -Wait   # 看每一輪的
 
 - 排程建立在 `\DeviceOnSim\MemLeak`，以目前使用者身分、只在登入時執行（不儲存密碼）。執行時間超過 `GrowSeconds + HoldSeconds + 120` 秒會被排程器強制結束；同一時間只會有一個 instance。
 - 如果裝置本身的記憶體已經很滿，`FloorPercent` 會讓它幾乎配置不了任何記憶體（log 會寫 `below floor`），這時候就看不到效果。可以先調低 `-FloorPercent`，或關掉其他程式。
-- **偵測**：讓 `usagePhysMem` 存入歷史資料，請 Agent 用 `analyze_metric_periodicity`，sensor 為 `ProcessMonitor:/System Monitor Info/usagePhysMem`。
-- **現有工具的限制**：`capture_top_processes` 目前只用 CPU 的相關性找元兇。它的輸出也不含各 process 的記憶體用量。記憶體情境的 CPU 很低，所以現有工具**能偵測到週期性，但無法指出 `mem_leak.exe`**。要完整支援這個情境，需要在 MCP Server 加入以記憶體為依據的定位功能。
+**建議參數要依裝置的記憶體大小調整**：配置量至少要達到總記憶體的 20% 以上，才能明顯超過背景雜訊。實測 DESKTOP-MT3CC6E（30 GB）閒置時，`usagePhysMem` 在 1 小時內自然擺動約 7 個百分點；預設的 2048 MB 只佔 6.5 個百分點，會被雜訊淹沒。這台建議使用：
+
+```powershell
+.\install.ps1 -IntervalMinutes 6 -GrowSeconds 120 -HoldSeconds 150 -MaxMB 8192
+```
+
+約 26 個百分點；高點持續約 3–4 個樣本（裝置每 60 秒回報一次）；30 分鐘的視窗可以看到 5 輪。
+
+**預期的 Agent 流程**：
+`analyze_metric_periodicity(sensor="memory")`（periodic=true，`next_step_hint` 會提示改用 `metric='memory'`）→ `capture_top_processes(metric="memory", duration_sec ≥ period_sec)` → suspect 是 `mem_leak.exe`，附有 `pids_seen` 和 `recurrence_hint` → Agent 應該告訴使用者「kill 只能結束這一輪，要去停用排程」。
+
+**`metric="memory"` 如何判斷**：
+- 系統序列使用同一份快照中的 `totalPhysMemKB - availPhysMemKB`；各 process 使用 `Mem Usage`（單位是 KB，已在實機確認）。
+- 系統已使用量至少要變動 `max(500 MB, 總記憶體的 5%)`，才算抓到尖峰。
+- 判斷依據是**增加量**（`spike_delta_mb`＝高點時的平均減掉平時的平均），不是絕對用量。平常就佔 250 MB 的 explorer.exe 不會被誤判。
+- 同一個名稱的 PID 換了、但從來沒有同時存在，就合併成一筆（`pids_seen`），並在 suspect 附上 `lifecycle` 與 `recurrence_hint`。CPU 模式也適用這個規則。
+- `system_memory.explained_by_listed_processes`：清單中 process 的增加量能解釋系統增加量的比例。低於 0.5 時會提醒「元兇可能是 agent 沒有回報的 process」。實測這台 agent 的清單只涵蓋約 56% 的已使用記憶體，系統服務可能不在清單裡。
+- 用 CPU 模式抓 process 時，如果 CPU 沒有尖峰、但記憶體有明顯變化，notes 會提示改用 `metric='memory'`。
+
+### 情境三：視窗程式死結，顯示「沒有回應」（Windows）
+
+模擬「程式沒有吃 CPU 也沒有吃記憶體，但畫面卡死」。`hang_app.exe` 是一個 WinForms 視窗，上面有每秒加 1 的計數器。`--after` 秒後，UI thread 和一個 worker thread 會互相等待：worker 先拿到鎖，再用 `Control.Invoke` 等 UI thread 執行；UI thread 則在等那把鎖。結果：
+
+- 計數器停住，約 5 秒後 Windows 把視窗標成「沒有回應」（`Process.Responding == false`）。
+- CPU 約 0%、記憶體不變，所以 `analyze_metric_periodicity` 和 `capture_top_processes` **都看不出異常**，要靠 `find_unresponsive_windows` 才找得到。
+- 兩個 thread 都卡在一般的 user-mode wait，`taskkill /f` 或 `request_kill_process` + `confirm_action` 可以正常結束它（已在本機驗證）。
+
+```powershell
+cd simulator\windows-hang
+.\build.bat                         # 產生 hang_app.exe
+# 複製到裝置上，在「已登入使用者的桌面」執行（不能用 SYSTEM 或服務身分，否則看不到視窗）：
+.\hang_app.exe                      # 30 秒後死結
+.\hang_app.exe --after 60           # 60 秒後死結
+.\hang_app.exe --after 0            # 只在按下按鈕時死結
+taskkill /im hang_app.exe /f        # 結束
+Get-Content $env:TEMP\deviceon-sim\hang_app.log   # PID、啟動時間、死結時間
+```
+
+**預期的 Agent 流程**：使用者說「某台機器上的程式卡住了」→ `analyze_metric_periodicity`／`get_current_metrics` 看起來正常 → `find_unresponsive_windows` → `not_responding` 裡有 `hang_app.exe`（pid、視窗標題）→ （選用）`take_screenshot` 看畫面 → `request_kill_process` → 詢問使用者 → `confirm_action`。
+
+實測（2026-11-18，DESKTOP-MT3CC6E）：`find_unresponsive_windows` 約 3 秒完成，正確找出 `hang_app.exe`。背景被 Windows 暫停的 UWP 程式（例如 `SystemSettings.exe`）也會回報 `Responding=False`，所以另外列在 `suspended_by_windows`，不算卡死。
+
+**為什麼不從 agent 的 process 清單判斷**：API 文件裡每個 process 有 `IsActive` 欄位，但用 `scripts/probe_process_fields.py` 實測，這台 agent **完全沒有回報這個欄位**，只有 `Name`、`PID`、`Owner`、`CPU Usage`、`Mem Usage`。所以改用遠端執行，在使用者 session 裡檢查 `Process.Responding`（見[遠端執行是怎麼做的](#遠端執行是怎麼做的)）。probe 腳本仍保留，可以用來檢查其他 agent 版本有沒有回報新欄位：
+
+```powershell
+python scripts\probe_process_fields.py --device <裝置名稱> --name hang_app --duration 180
+```
 
 ## 第一次接實機時要確認的事
 
@@ -377,3 +537,7 @@ Get-Content $env:LOCALAPPDATA\DeviceOnSim\mem_leak.log -Wait   # 看每一輪的
 - 使用 Basic 認證時，每個請求都會觸發一次登入（bcrypt 驗證和稽核）。正式環境建議改用 `DEVICEON_TOKEN`。
 - 確認 token 存在記憶體中，server 重啟後就會失效（這是刻意的設計）。多實例部署時需要改用共享儲存。
 - 無法取得 CPU 頻率（DeviceOn 沒有回報這個欄位）；溫度需要研華硬體加上 SUSI。
+- 週期分析以 p95 作為「高點」，等於假設尖峰至少佔 5% 的樣本：
+  - **剛開始的異常**：已經處理。整個視窗判定不顯著時，會依序改用最近 1/2、1/4、1/8 的視窗重算，判斷標準不變，片段最短 10 分鐘、10 個樣本。成功時會回傳 `analyzed_window_min` 和 `pattern_started_at`（從最新的尖峰往回推，直到週期中斷為止）。這不需要多抓資料。實機驗證：DESKTOP-MT3CC6E 在 180 分鐘視窗中原本判定不顯著，改用最近 90 分鐘後抓到週期 360.8 秒，起始時間 13:49，與排程安裝的時間吻合。
+  - **尖峰佔的時間太短**：還沒處理。例如每 20 分鐘只尖峰 30 秒（佔 2.5%），不管視窗多長都抓不到。
+  - **已經停止的異常**：例如只出現在視窗前段，後來 process 被 kill 了。這種情況不會特別去找，因為設計上關注的是「現在是否還在發生」。

@@ -1,12 +1,22 @@
 """End-to-end tests of the tool logic against the fake DeviceOn REST API."""
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
+from deviceon_mcp import actions
+from deviceon_mcp.tools import control
 from deviceon_mcp.tools.common.devices import list_devices
+from deviceon_mcp.tools.control import kill
 from deviceon_mcp.tools.diagnose import metrics, processes
 
-from fake_deviceon import DID, STRESS_NAME, STRESS_PID
+from fake_deviceon import DID, LEAK_NAME, STRESS_NAME, STRESS_PID
+
+
+@pytest.fixture(autouse=True)
+def _control_actions(deps):
+    """Kill lives in toolset 'control'; register its confirm_action executors."""
+    control.register(FastMCP("test"), deps)
 
 
 async def test_list_devices_filters_by_name(deps, fake):
@@ -28,6 +38,18 @@ async def test_analyze_detects_periodic_cpu(deps):
     assert abs(r["period_sec"] - 180) <= 5
     assert r["sensor"] == "ProcessMonitor:/System Monitor Info/CPU Usage"
     assert r["device"]["name"] == "Line-B-AOI-03"
+
+
+async def test_analyze_long_window_keeps_newest_samples(deps, fake):
+    # 24 h at 5 s = 17280 samples > 10000 cap: the newest must be kept, the oldest dropped.
+    r = await metrics.analyze_metric_periodicity(deps, DID, "cpu", 1440)
+    assert r["samples"] == 10_000
+    assert r["data_staleness_sec"] <= 5
+    assert "latest sample is old" not in " ".join(r["notes"])
+    assert any("capped at the newest" in n for n in r["notes"])
+    assert r["periodic"] is True
+    hist = [req for req in fake.requests if req.url.path.endswith("/histdata")]
+    assert "order=desc" in str(hist[-1].url) and "amount=10000" in str(hist[-1].url)
 
 
 async def test_analyze_temperature_resolves_susi_sensor(deps):
@@ -70,14 +92,14 @@ async def test_capture_dedupes_cached_snapshots(deps):
 
 async def test_protected_process_is_refused(deps, fake):
     with pytest.raises(ToolError, match="protected"):
-        await processes.request_kill_process(deps, DID, 1, "systemd")
+        await kill.request_kill_process(deps, DID, 1, "systemd")
     with pytest.raises(ToolError, match="protected"):
-        await processes.request_kill_process(deps, DID, 100, "cagent")
+        await kill.request_kill_process(deps, DID, 100, "cagent")
     assert fake.killed == []
 
 
 async def test_request_does_not_kill(deps, fake):
-    r = await processes.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME, "tracks spikes")
+    r = await kill.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME, "tracks spikes")
     assert r["confirm_token"] and r["summary"]["process"]["pid"] == STRESS_PID
     assert fake.killed == []
     assert not any(req.method == "PUT" and req.url.path == "/rmm/v1/processes" for req in fake.requests)
@@ -85,16 +107,16 @@ async def test_request_does_not_kill(deps, fake):
 
 async def test_request_rejects_wrong_name(deps):
     with pytest.raises(ToolError, match="reused"):
-        await processes.request_kill_process(deps, DID, STRESS_PID, "nginx")
+        await kill.request_kill_process(deps, DID, STRESS_PID, "nginx")
 
 
 async def test_full_kill_flow_and_token_is_single_use(deps, fake):
-    token = (await processes.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
-    r = await processes.confirm_kill_process(deps, token)
+    token = (await kill.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
+    r = await actions.confirm_action(deps, token)
     assert r["status"] == "killed" and r["killed"] is True
     assert fake.killed == [STRESS_PID]
     with pytest.raises(ToolError, match="unknown, already used, or expired"):
-        await processes.confirm_kill_process(deps, token)
+        await actions.confirm_action(deps, token)
 
     # after the kill the periodic pattern is gone in fresh history
     fake.now += 30 * 60_000
@@ -103,17 +125,17 @@ async def test_full_kill_flow_and_token_is_single_use(deps, fake):
 
 
 async def test_confirm_aborts_when_pid_reused(deps, fake):
-    token = (await processes.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
+    token = (await kill.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
     fake.stress_name = "postgres"  # same pid now belongs to another program
     fake.now += 10_000
-    r = await processes.confirm_kill_process(deps, token)
+    r = await actions.confirm_action(deps, token)
     assert r["status"] == "aborted_pid_reused" and r["killed"] is False
     assert fake.killed == []
 
 
 async def test_confirm_with_garbage_token(deps):
     with pytest.raises(ToolError):
-        await processes.confirm_kill_process(deps, "not-a-token")
+        await actions.confirm_action(deps, "not-a-token")
 
 
 # ---- process-list delivery (intermittent report / live table) ---------------
@@ -161,23 +183,23 @@ async def test_capture_on_offline_device_fails_clearly(deps, fake):
 
 async def test_request_kill_uses_fresh_list(deps, fake):
     # The stale leftover lists the stress pid too; request must still trigger a live report.
-    await processes.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME)
+    await kill.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME)
     assert len(fake.intermittent_calls) == 1
 
 
 async def test_confirm_aborts_without_fresh_data(deps, fake):
-    token = (await processes.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
+    token = (await kill.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
     fake.now += 3600_000          # live report long expired
     fake.agent_ignores_live = True  # and the agent stops answering
-    r = await processes.confirm_kill_process(deps, token)
+    r = await actions.confirm_action(deps, token)
     assert r["status"] == "aborted_no_fresh_data" and r["killed"] is False
     assert fake.killed == []
 
 
 async def test_confirm_unverified_when_process_survives(deps, fake):
     fake.ignore_kill = True
-    token = (await processes.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME))["confirm_token"]
-    r = await processes.confirm_kill_process(deps, token, verify_timeout_sec=10)
+    token = (await kill.request_kill_process(deps, DID, STRESS_PID, STRESS_NAME, verify_timeout_sec=10))["confirm_token"]
+    r = await actions.confirm_action(deps, token)
     assert r["status"] == "kill_sent_unverified" and r["killed"] is False
 
 
@@ -186,3 +208,66 @@ async def test_current_metrics_uses_periodic_copy(deps, fake):
     pm_reads = [req for req in fake.requests
                 if req.url.path.endswith("/latestdata") and "plugin=ProcessMonitor" in str(req.url)]
     assert pm_reads and all("source=autoreport" in str(req.url) for req in pm_reads)
+
+
+# ---- metric="memory" (scheduled job that grows memory, new pid every run) -------
+
+
+async def test_analyze_memory_alias_detects_periodic_usage(deps, fake):
+    fake.scenario = "memory"
+    r = await metrics.analyze_metric_periodicity(deps, DID, "memory", 30)
+    assert r["sensor"] == "ProcessMonitor:/System Monitor Info/usagePhysMem"
+    assert r["periodic"] is True and abs(r["period_sec"] - 180) <= 5
+    assert "metric='memory'" in r["next_step_hint"]
+
+
+async def test_capture_memory_finds_scheduled_leaker(deps, fake):
+    fake.scenario = "memory"
+    r = await processes.capture_top_processes(deps, DID, duration_sec=200, samples=21, metric="memory")
+    assert r["metric"] == "memory"
+    assert r["system_memory"]["spike_observed"] is True
+    s = r["suspect"]
+    assert s["type"] == "process" and s["name"] == LEAK_NAME
+    # two runs seen during the capture, each with its own pid, never at the same time
+    assert len(s["pids_seen"]) == 2
+    assert s["lifecycle"]["respawned"] is True and s["lifecycle"]["max_concurrent"] == 1
+    assert "only ends the current run" in s["recurrence_hint"]
+    # explorer uses more memory at rest but does not grow: ranked below the leaker, not a suspect
+    names = [p["name"] for p in r["top_processes"]]
+    assert names[0] == LEAK_NAME and "explorer.exe" in names
+    assert r["top_processes"][0]["spike_delta_mb"] > 1000
+    assert r["system_memory"]["explained_by_listed_processes"] > 0.8
+    # merged into one row, not reported as a concurrent process group
+    assert not any(g["name"] == LEAK_NAME for g in r["top_process_groups"])
+
+
+async def test_capture_cpu_on_memory_anomaly_points_to_memory(deps, fake):
+    fake.scenario = "memory"
+    r = await processes.capture_top_processes(deps, DID, duration_sec=200, samples=21)
+    assert r["system_cpu"]["spike_observed"] is False and r["suspect"] is None
+    assert any("metric='memory'" in n for n in r["notes"])
+
+
+async def test_capture_memory_reports_unexplained_growth(deps, fake):
+    fake.scenario, fake.hide_leak = "memory", True
+    r = await processes.capture_top_processes(deps, DID, duration_sec=200, samples=21, metric="memory")
+    assert r["system_memory"]["spike_observed"] is True
+    assert r["suspect"] is None
+    assert any("does not report" in n for n in r["notes"])
+
+
+async def test_capture_memory_without_rise(deps, fake):
+    fake.scenario = "memory"
+    fake.now += 100_000  # between runs
+    r = await processes.capture_top_processes(deps, DID, duration_sec=30, samples=7, metric="memory")
+    assert r["system_memory"]["spike_observed"] is False and r["suspect"] is None
+
+
+async def test_capture_rejects_unknown_metric(deps):
+    with pytest.raises(ToolError, match="metric"):
+        await processes.capture_top_processes(deps, DID, metric="disk")
+
+
+async def test_cpu_suspect_without_restart_has_no_recurrence_hint(deps):
+    r = await processes.capture_top_processes(deps, DID, duration_sec=200, samples=21)
+    assert r["suspect"]["pid"] == STRESS_PID and "recurrence_hint" not in r["suspect"]

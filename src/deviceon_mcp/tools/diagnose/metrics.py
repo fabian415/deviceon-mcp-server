@@ -16,6 +16,8 @@ CPU_PLUGIN = "ProcessMonitor"
 CPU_SENSOR = "/System Monitor Info/CPU Usage"
 MEM_TOTAL_SENSOR = "/System Monitor Info/totalPhysMemKB"
 MEM_AVAIL_SENSOR = "/System Monitor Info/availPhysMemKB"
+MEM_USAGE_SENSOR = "/System Monitor Info/usagePhysMem"  # percent, stored in history like CPU Usage
+HIST_MAX_SAMPLES = 10_000  # DeviceOn histdata caps `amount` at 10000
 
 # Plugins that typically carry hardware temperatures (SUSI / hardware monitor).
 _TEMP_PLUGIN_HINTS = ("susi", "hwm", "hardware", "thermal", "temperature")
@@ -56,10 +58,12 @@ def _pick_cpu_temp(temps: dict[str, float]) -> str | None:
 
 
 async def resolve_sensor(deps: Deps, dev: dict, sensor: str) -> tuple[str, str]:
-    """Map 'cpu' / 'temperature' / '<plugin>:<sensorId>' to (plugin, sensorId)."""
+    """Map 'cpu' / 'memory' / 'temperature' / '<plugin>:<sensorId>' to (plugin, sensorId)."""
     key = sensor.strip()
     if key.lower() == "cpu":
         return CPU_PLUGIN, CPU_SENSOR
+    if key.lower() in ("memory", "mem"):
+        return CPU_PLUGIN, MEM_USAGE_SENSOR
     if key.lower() in ("temperature", "temp"):
         plugin, temps = await find_temperatures(deps, dev)
         chosen = _pick_cpu_temp(temps)
@@ -74,7 +78,7 @@ async def resolve_sensor(deps: Deps, dev: dict, sensor: str) -> tuple[str, str]:
         if not sensor_id.startswith("/"):
             raise ToolError("sensorId must start with '/', e.g. 'ProcessMonitor:/System Monitor Info/CPU Usage'")
         return plugin, sensor_id
-    raise ToolError("sensor must be 'cpu', 'temperature', or '<plugin>:<sensorId>'")
+    raise ToolError("sensor must be 'cpu', 'memory', 'temperature', or '<plugin>:<sensorId>'")
 
 
 async def analyze_metric_periodicity(
@@ -92,7 +96,11 @@ async def analyze_metric_periodicity(
     end = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
     begin = end - timedelta(minutes=window_min)
     try:
-        items = await deps.client.get_hist_data(did, dev["agentId"], plugin, sensor_id, begin, end)
+        # newest first: if the window holds more than HIST_MAX_SAMPLES, the OLDEST samples
+        # are the ones dropped (analyze_periodicity re-sorts by time anyway).
+        items = await deps.client.get_hist_data(
+            did, dev["agentId"], plugin, sensor_id, begin, end, amount=HIST_MAX_SAMPLES, order="desc"
+        )
     except DeviceOnError as ex:
         raise ToolError(
             f"cannot read history for {plugin}:{sensor_id}: {ex}. "
@@ -114,11 +122,18 @@ async def analyze_metric_periodicity(
         "window_min": window_min,
         **result,
     }
+    if len(items) >= HIST_MAX_SAMPLES:
+        result["notes"].append(
+            f"history capped at the newest {HIST_MAX_SAMPLES} samples; the start of the window is not covered. "
+            "Use a smaller window_min for full coverage."
+        )
     if not dev.get("connected"):
         result["notes"].append("device is currently offline.")
     if result.get("periodic"):
+        is_mem = plugin == CPU_PLUGIN and "PhysMem" in sensor_id
         result["next_step_hint"] = (
-            "Call capture_top_processes with duration_sec >= period_sec so the capture spans a spike."
+            f"Call capture_top_processes with metric='{'memory' if is_mem else 'cpu'}' and "
+            "duration_sec >= period_sec so the capture spans a spike."
         )
     return result
 

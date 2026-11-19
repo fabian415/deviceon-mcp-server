@@ -48,6 +48,49 @@ class _Segment:
     truncated_end: bool = False
 
 
+def _segments(pts: list[tuple[int, float]], threshold: float, step: float) -> list[_Segment]:
+    """Group consecutive samples >= threshold into spikes.
+
+    A data gap (> 3 steps) breaks a spike; spikes split by a single dipped sample are merged.
+    """
+    segments: list[_Segment] = []
+    cur: _Segment | None = None
+    prev_ts = None
+    for t, v in pts:
+        gap = prev_ts is not None and t - prev_ts > 3 * step
+        if v >= threshold:
+            if cur is None or gap:
+                if cur is not None:
+                    segments.append(cur)
+                cur = _Segment(t, t, [v])
+            else:
+                cur.end = t
+                cur.values.append(v)
+        elif cur is not None:
+            segments.append(cur)
+            cur = None
+        prev_ts = t
+    if cur is not None:
+        segments.append(cur)
+
+    merged: list[_Segment] = []
+    for seg in segments:
+        if merged and seg.start - merged[-1].end <= 2 * step:
+            merged[-1].end = seg.end
+            merged[-1].values.extend(seg.values)
+        else:
+            merged.append(seg)
+    return merged
+
+
+# Recent-onset fallback: when the full window shows nothing, retry on its most recent
+# 1/2, 1/4, 1/8 (longest first: more periods = more evidence), but never on less than
+# 10 minutes or 10 samples.
+_TAIL_DIVISORS = (2, 4, 8)
+_MIN_TAIL_MS = 10 * 60_000
+_MIN_TAIL_SAMPLES = 10
+
+
 def analyze_periodicity(
     points: list[tuple[int, float]],
     now_ms: int,
@@ -56,6 +99,80 @@ def analyze_periodicity(
     max_jitter_ratio: float = 0.2,
 ) -> dict:
     """Detect recurring spikes in a (ts_ms, value) series.
+
+    First analyses the whole window. If no periodic pattern is found there, a pattern that
+    started recently may have been diluted by the quiet part of the window (the high level
+    is taken at p95, which assumes spikes fill >= 5% of the samples). So the most recent
+    1/2, 1/4, 1/8 of the window are tried in turn with the SAME acceptance criteria; the
+    first periodic one is returned, together with when the pattern started
+    (pattern_started_at) and analyzed_window_min. No extra data is fetched.
+    """
+    full = _analyze_core(points, now_ms, window_ms, min_amplitude, max_jitter_ratio)
+    if full["periodic"] or full["samples"] < 10:
+        return full
+
+    pts = sorted({ts: v for ts, v in points}.items())
+    step = statistics.median(b[0] - a[0] for a, b in zip(pts, pts[1:]) if b[0] > a[0])
+    for div in _TAIL_DIVISORS:
+        tail_ms = window_ms // div
+        if tail_ms < _MIN_TAIL_MS:
+            break
+        tail_start = now_ms - tail_ms
+        tail = [p for p in pts if p[0] >= tail_start]
+        if len(tail) < _MIN_TAIL_SAMPLES:
+            break
+        r = _analyze_core(tail, now_ms, tail_ms, min_amplitude, max_jitter_ratio)
+        if not r["periodic"]:
+            continue
+        tail_min = round(tail_ms / 60_000)
+        r["analyzed_window_min"] = tail_min
+        r["full_window"] = {"samples": full["samples"], "anomalous": full["anomalous"], "notes": full["notes"]}
+        onset = _pattern_onset(pts, r["threshold"], step, r["period_sec"] * 1000, max_jitter_ratio)
+        since = ""
+        if onset is not None:
+            r["pattern_started_at"] = _iso(onset)
+            since = f" (started ~{r['pattern_started_at']})"
+        r["notes"].insert(
+            0,
+            f"the pattern is only present in the most recent {tail_min} min{since}; over the full "
+            f"{round(window_ms / 60_000)} min window it was diluted below the detection threshold.",
+        )
+        return r
+    return full
+
+
+def _pattern_onset(
+    pts: list[tuple[int, float]],
+    threshold: float,
+    step: float,
+    period_ms: float,
+    max_jitter_ratio: float,
+) -> int | None:
+    """When the periodic pattern began.
+
+    The pattern is ongoing, so the newest spike belongs to it. Walk back over earlier spikes
+    (whole series, same threshold) while each is one period before the next; the first one
+    that breaks the rhythm (a one-off spike, or quiet time) ends the walk. A single missed
+    spike also ends it, so the result can be later than the true start, never earlier.
+    """
+    starts = [s.start for s in _segments(pts, threshold, step)]
+    if not starts:
+        return None
+    i = len(starts) - 1
+    tol = max(max_jitter_ratio * period_ms, 2 * step)
+    while i > 0 and abs((starts[i] - starts[i - 1]) - period_ms) <= tol:
+        i -= 1
+    return starts[i]
+
+
+def _analyze_core(
+    points: list[tuple[int, float]],
+    now_ms: int,
+    window_ms: int,
+    min_amplitude: float = 20.0,
+    max_jitter_ratio: float = 0.2,
+) -> dict:
+    """Detect recurring spikes in one window.
 
     Approach: split samples into high/low around the midpoint between the 20th and
     95th percentile, group consecutive highs into spike segments, then check whether
@@ -97,35 +214,7 @@ def analyze_periodicity(
         )
         return result
 
-    # Group consecutive high samples; a data gap (> 3 steps) breaks a segment.
-    segments: list[_Segment] = []
-    cur: _Segment | None = None
-    prev_ts = None
-    for t, v in pts:
-        gap = prev_ts is not None and t - prev_ts > 3 * step
-        if v >= threshold:
-            if cur is None or gap:
-                if cur is not None:
-                    segments.append(cur)
-                cur = _Segment(t, t, [v])
-            else:
-                cur.end = t
-                cur.values.append(v)
-        elif cur is not None:
-            segments.append(cur)
-            cur = None
-        prev_ts = t
-    if cur is not None:
-        segments.append(cur)
-
-    # Merge spikes split by a single dipped sample.
-    merged: list[_Segment] = []
-    for seg in segments:
-        if merged and seg.start - merged[-1].end <= 2 * step:
-            merged[-1].end = seg.end
-            merged[-1].values.extend(seg.values)
-        else:
-            merged.append(seg)
+    merged = _segments(pts, threshold, step)
     if merged:
         merged[0].truncated_start = merged[0].start == ts[0]
         merged[-1].truncated_end = merged[-1].end == ts[-1]

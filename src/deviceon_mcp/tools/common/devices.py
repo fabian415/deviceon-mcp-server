@@ -10,8 +10,21 @@ from ...deps import Deps
 LIKE_FIELDS = ("name", "agentId", "mac", "localIP", "platformName", "osType", "osArch")
 
 
-def _plugin_names(dev: dict) -> list[str]:
+def plugin_names(dev: dict) -> list[str]:
     return [p.get("plugin") for p in dev.get("plugins") or [] if isinstance(p, dict) and p.get("plugin")]
+
+
+_plugin_names = plugin_names  # backward-compatible private name
+
+
+def require_online(dev: dict, what: str = "this action") -> None:
+    if not dev.get("connected"):
+        raise ToolError(f"device {dev.get('did')} ({dev.get('name')}) is offline; {what} needs a connected agent.")
+
+
+def device_ref(dev: dict) -> dict:
+    """Compact device identity for summaries."""
+    return {"did": dev.get("did"), "name": dev.get("name"), "online": bool(dev.get("connected"))}
 
 
 def compact_device(dev: dict) -> dict:
