@@ -8,7 +8,7 @@ from deviceon_mcp.tools import register_toolsets
 
 ALL = {
     "list_devices", "analyze_metric_periodicity", "get_current_metrics",
-    "capture_top_processes", "find_unresponsive_windows",
+    "capture_top_processes", "find_unresponsive_windows", "find_process_autostart",
 }
 
 
@@ -26,6 +26,7 @@ async def test_diagnose_toolset_is_read_only(deps):
 CONTROL = {
     "get_device_capabilities", "take_screenshot", "request_kill_process", "request_power_action", "request_set_data",
     "request_kvm_session", "request_protection_action", "request_recovery_action", "confirm_action",
+    "find_wol_relay_candidates", "request_configure_wol", "wait_for_device_online", "request_disable_autostart",
 }
 
 

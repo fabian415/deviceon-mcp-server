@@ -36,6 +36,9 @@ LEAK_PID_BASE = 5000
 LEAK_PEAK_MB = 4096
 LEAK_GROW_MS = 60_000
 LEAK_HOLD_MS = 30_000
+# Wake-on-LAN relay on the same /23 but a different /24 (like 172.22.12.255 / 172.22.13.77 on the real LAN)
+RELAY_DID = 8
+RELAY_AGENT_ID = "00000001-0000-0000-0000-0000000000AA"
 
 
 def _e(name, value):
@@ -85,6 +88,13 @@ class FakeDeviceOn:
         self.launch_result = True          # False: agent refuses (e.g. nobody logged on)
         self.devlog_error = ""             # e.g. "500:Copyfile fail : Syntax or usage error (&d)"
         self.devlog_requests: list[dict] = []
+        # Wake-on-LAN (DeviceMgmt.editWOL) and the relay device
+        self.wolmode = 2
+        self.wolrepeater = RELAY_AGENT_ID
+        self.wol_calls: list[dict] = []
+        self.relay_connected = True
+        self.online_at: int | None = None   # offline device comes back at this fake time (after WOL)
+        self.scenario_pressure_until: int | None = None   # memory climbs to 92 % until this time, then no data
 
     # -- simulated signal -----------------------------------------------
     def alive(self) -> bool:
@@ -133,6 +143,16 @@ class FakeDeviceOn:
             return self._devices(q)
         if req.method == "GET" and path == f"/rmm/v1/devices/{DID}":
             return httpx.Response(200, json={"total": 1, "devices": [self._device()]})
+        if req.method == "GET" and path == f"/rmm/v1/devices/{RELAY_DID}":
+            return httpx.Response(200, json={"total": 1, "devices": [self._relay()]})
+        if req.method == "PATCH" and path == "/rmm/v1/devices/wol":
+            body = json.loads(req.content)
+            dev = body["devices"][0]
+            assert isinstance(dev["did"], int) and isinstance(dev["wolmode"], int) and isinstance(dev["wolrepeater"], str)
+            self.wol_calls.append(body)
+            if dev["did"] == DID:
+                self.wolmode, self.wolrepeater = dev["wolmode"], dev["wolrepeater"]
+            return httpx.Response(200, json={"result": True})
         if req.method == "GET" and path.startswith("/rmm/v1/devices/"):
             return httpx.Response(404, json={"errorCode": 1})
         if req.method == "GET" and path == f"/rmm/v1/data/devices/{DID}/histdata":
@@ -229,17 +249,46 @@ class FakeDeviceOn:
         plugins = ("ProcessMonitor", "SUSIControl", "terminal", "power_onoff", "screenshot", "remote_kvm",
                    "protection", "recovery", "Syslog", "Modbus_Handler")
         return {
-            "did": DID, "name": "Line-B-AOI-03", "agentId": AGENT_ID, "connected": self.connected,
-            "ostype": self.ostype, "localip": "10.0.0.31", "cpuname": "Intel Core i5",
+            "did": DID, "name": "Line-B-AOI-03", "agentId": AGENT_ID, "connected": self.is_connected(),
+            "ostype": self.ostype, "localip": "10.0.0.31", "cpuname": "Intel Core i5", "mac": "000BAB578433",
+            "wolmode": self.wolmode, "wolrepeater": self.wolrepeater, "login_unix_ts": 1_795_000_000_000,
             "devicegroups": [{"gid": 1, "name": "Line-B"}],
-            "plugins": [{"plugin": p, "normal": True} for p in plugins],
+            "functionList": "wol,shutdown,restart,hibernate",
+            # Like the real API, an offline device reports no plugins (DS054, 2026-11-20).
+            "plugins": [{"plugin": p, "normal": True} for p in plugins] if self.is_connected() else [],
+        }
+
+    def is_connected(self) -> bool:
+        if not self.connected and self.online_at is not None and self.now >= self.online_at:
+            self.connected = True
+        return self.connected
+
+    def _relay(self) -> dict:
+        return {
+            "did": RELAY_DID, "name": "Line-B-HMI-01", "agentId": RELAY_AGENT_ID, "connected": self.relay_connected,
+            "ostype": "Windows 10 Enterprise", "localip": "10.0.1.20", "mac": "000BAB0000AA", "wolmode": 0,
+            "wolrepeater": "", "login_unix_ts": 1_795_100_000_000, "devicegroups": [{"gid": 1, "name": "Line-B"}],
+            "plugins": [{"plugin": p, "normal": True} for p in ("terminal", "power_onoff", "ProcessMonitor")],
         }
 
     def _devices(self, q: dict) -> httpx.Response:
-        devs = [self._device()]
-        like = q.get("like")
+        devs = []
+        for d in (self._device(), self._relay()):
+            # the list API names the agent id field 'agentid' (lowercase) and adds wolrepeatername
+            entry = {k: v for k, v in d.items() if k != "agentId"}
+            entry["agentid"] = d["agentId"]
+            if d["did"] == DID and self.wolmode == 2:
+                entry["wolrepeatername"] = self._relay()["name"] if self.wolrepeater == RELAY_AGENT_ID else ""
+            devs.append(entry)
+        like, field = q.get("like"), q.get("likeField", "name")
         if like:
-            devs = [d for d in devs if like.lower() in d["name"].lower()]
+            key = "agentid" if field == "agentId" else field
+            devs = [d for d in devs if like.lower() in str(d.get(key, "")).lower()]
+        if "connected" in q:
+            devs = [d for d in devs if d["connected"] == (q["connected"] == "true")]
+        if q.get("orderBy"):
+            key = {"logints": "login_unix_ts"}.get(q["orderBy"], q["orderBy"])
+            devs.sort(key=lambda d: d.get(key) or 0, reverse=q.get("orderType", "asc").lower() == "desc")
         return httpx.Response(200, json={"total": len(devs), "devices": devs})
 
     def _histdata(self, q: dict) -> httpx.Response:
@@ -251,6 +300,12 @@ class FakeDeviceOn:
         t = begin - begin % STEP_MS + STEP_MS
         while t <= end:
             v = self.mem_usage_pct(t) if q["sensorId"].endswith("usagePhysMem") else self.system_cpu(t)
+            if self.scenario_pressure_until is not None:
+                if t > self.scenario_pressure_until:
+                    break   # the device was off after this point
+                if q["sensorId"].endswith("usagePhysMem"):
+                    frac = (t - (self.scenario_pressure_until - 3_600_000)) / 3_600_000
+                    v = 40 + 52 * min(1.0, max(0.0, frac))
             items.append({"sensorId": q["sensorId"], "v": v, "ts": t, "opTS": t - 3})
             t += STEP_MS
         # Like DataMgmt: sort by `order` (desc unless "asc"), then keep the first `amount`.
@@ -359,6 +414,15 @@ class FakeTerminal:
                                     "source": "Service Control Manager", "message": "The X service terminated."}]
         self.eventlog_error: str | None = None
         self.fail = False
+        self.agents: list[str] = []
+        # find_wol_relay_candidates: the relay's own IPv4 config (Get-NetIPAddress) and ARP hit
+        self.relay_addrs = [{"ip": "10.0.1.20", "prefix": 23, "nic": "Ethernet"}]
+        self.relay_neighbor = ["10.0.0.31"]
+        # $r of analyze_last_shutdown / find_process_autostart / request_disable_autostart probes
+        self.shutdown_probe: dict = {}
+        self.autostart_result: dict = {}
+        self.task_state: dict = {"exists": False}
+        self.disabled: list[str] = []
 
     @classmethod
     def _emit(cls, text: str) -> str:
@@ -368,12 +432,31 @@ class FakeTerminal:
         from deviceon_mcp.terminal import TerminalError, TerminalResult
         if self.fail:
             raise TerminalError("terminal connection failed: refused")
-        assert agent_id == AGENT_ID
+        assert agent_id in (AGENT_ID, RELAY_AGENT_ID)
+        self.agents.append(agent_id)
         assert len(cmdline) <= 7_500, "websocket message would exceed the server's ~8 KB limit"
         script = cmdline
         if "-EncodedCommand " in cmdline:
             script = base64.b64decode(cmdline.split("-EncodedCommand ", 1)[1]).decode("utf-16-le")
         self.calls.append(script)
+        if "#DOMCP:" in script:
+            tag = script.split("#DOMCP:", 1)[1].split("\n", 1)[0].strip()
+            if tag == "subnet":
+                assert agent_id == RELAY_AGENT_ID
+                payload = {"addrs": self.relay_addrs[0] if len(self.relay_addrs) == 1 else self.relay_addrs,
+                           "neighbor": self.relay_neighbor}
+            elif tag == "shutdown":
+                payload = self.shutdown_probe
+            elif tag == "autostart":
+                payload = self.autostart_result
+            elif tag == "autostart-state":
+                payload = self.task_state
+            elif tag == "autostart-disable":
+                self.disabled.append(script)
+                payload = {"state": "Disabled", "still_running_pids": []}
+            else:
+                raise AssertionError(f"unknown probe {tag}")
+            return TerminalResult(self._emit(json.dumps(payload)), True, 0.5)
         if "'staged'" in script:
             b64 = script.split("FromBase64String('", 1)[1].split("'", 1)[0]
             run_id = re.search(r"DeviceOnMCP\\(\w+)\.ps1", script).group(1)

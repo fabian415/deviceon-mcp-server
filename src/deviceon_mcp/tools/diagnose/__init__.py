@@ -10,7 +10,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ...deps import Deps
-from . import metrics, processes, windows
+from . import autostart, metrics, processes, windows
 
 Did = Annotated[int, Field(description="Device id (did) from list_devices")]
 
@@ -77,3 +77,17 @@ def register(mcp: FastMCP, deps: Deps) -> None:
         not_responding entries with pid, name and window title.
         """
         return await windows.find_unresponsive_windows(deps, did)
+
+    @mcp.tool(annotations=ToolAnnotations(title="Find process autostart", readOnlyHint=True, openWorldHint=False))
+    async def find_process_autostart(
+        did: Did,
+        names: Annotated[list[str], Field(description="1-5 program file names, e.g. ['pressure_leak.exe'] (from analyze_last_shutdown suspects or capture_top_processes)")],
+    ) -> dict:
+        """Find what starts a program automatically on a Windows device: scheduled tasks, services, Run keys, Startup folders.
+
+        Use when a culprit process keeps coming back (after a kill or a reboot): killing it
+        only helps until the next start. Also lists running instances with their parent.
+        Read-only (~5-15 s). To turn a task/service off use request_disable_autostart
+        (toolset 'control').
+        """
+        return await autostart.find_process_autostart(deps, did, names)

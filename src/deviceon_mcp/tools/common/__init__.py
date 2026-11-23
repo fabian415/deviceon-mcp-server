@@ -24,14 +24,19 @@ def register(mcp: FastMCP, deps: Deps) -> None:
         field: Annotated[str, Field(description="Which attribute 'filter' matches: name, agentId, mac, localIP, platformName, osType, osArch")] = "name",
         connected_only: Annotated[bool, Field(description="Only return devices currently online")] = False,
         limit: Annotated[int, Field(description="Max devices to return (1-100)")] = 20,
+        offline_only: Annotated[bool, Field(description="Only return devices currently offline (e.g. shut down)")] = False,
+        recent_first: Annotated[bool, Field(description="Sort by lastConnectedAt, newest first (server-side, across all pages). Combine with offline_only to find devices that dropped off recently.")] = False,
     ) -> dict:
         """Find DeviceOn devices and their numeric device id (did).
 
         Use this first whenever the user refers to a device by name, IP or MAC; every
         other tool needs the did. 'canDiagnoseProcesses' tells whether the device has
-        the ProcessMonitor plugin required by the diagnose tools.
+        the ProcessMonitor plugin required by the diagnose tools. 'wakeOnLan' shows the
+        device's Wake-on-LAN mode (agent = woken through a neighbouring device).
+        'lastConnectedAt' is when the agent last came online (local time); for an offline
+        device it is the start of its last session, not the moment it dropped.
         """
-        return await devices.list_devices(deps, filter, field, connected_only, limit)
+        return await devices.list_devices(deps, filter, field, connected_only, limit, offline_only, recent_first)
 
 
 def register_confirm_action(mcp: FastMCP, deps: Deps) -> None:

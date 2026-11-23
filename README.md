@@ -12,20 +12,26 @@ AI Agent (OpenClaw)  ──MCP──▶  DeviceOn MCP Server  ──REST /rmm/v1
 
 | Toolset | 工具 | 類型 | 呼叫的 DeviceOn API |
 |---|---|---|---|
-| common | `list_devices` | 讀 | `GET /v1/devicegroups/devices` |
+| common | `list_devices`（`offline_only` 找已關機的裝置，附 `wakeOnLan` 模式與 `lastConnectedAt` 最後上線時間；`recent_first` 依最後上線時間新到舊排序） | 讀 | `GET /v1/devicegroups/devices` |
 | diagnose | `analyze_metric_periodicity` | 讀 | `GET /v1/devices/{did}`、`GET /v1/data/devices/{did}/histdata` |
 | diagnose | `get_current_metrics` | 讀 | `GET /v1/data/devices/{did}/latestdata?source=autoreport` |
 | diagnose | `capture_top_processes`（`metric`: `cpu` / `memory`） | 讀 | `PUT /v1/devicectrl/intermittent_report` + `GET /v1/data/devices/{did}/latestdata`（取樣多次） |
 | diagnose | `find_unresponsive_windows` | 讀 | 遠端執行固定的唯讀檢查（使用者 session，見[遠端執行](#遠端執行是怎麼做的)） |
+| diagnose | `find_process_autostart` | 讀 | 遠端終端機執行固定的唯讀查詢：排程工作、服務、Run 機碼、啟動資料夾、執行中的 instance 與父 process |
 | control | `request_kill_process` | 讀（只發 token） | `intermittent_report` + `latestdata`（取一份最新的 process 清單）→ 確認後 `PUT /v1/processes`（`action: kill`） |
 | control | `get_device_capabilities` | 讀 | `GET /v1/devices/{did}`、`/v1/power/devices/{did}`、`/v1/protection/…`、`/v1/recovery/…`、`/v1/devlog` |
 | control | `take_screenshot` | 讀（回傳圖片） | `GET /v1/screenshot/devices/{did}?resType=base64` |
-| control | `request_power_action` | 讀（只發 token） | `GET /v1/power/devices/{did}` → 確認後 `PUT /v1/power/device` |
+| control | `request_power_action` | 讀（只發 token） | `GET /v1/power/devices/{did}` → 確認後 `PUT /v1/power/device`；`start` 會先檢查 WOL 模式與代理裝置是否在線 |
+| control | `find_wol_relay_candidates` | 讀 | `GET /v1/devicegroups/devices?connected=true`，再用終端機問候選裝置自己的子網路（`Get-NetIPAddress`） |
+| control | `request_configure_wol` | 讀（只發 token） | 確認後 `PATCH /v1/devices/wol`（需要 `EditDevice` 權限） |
+| control | `wait_for_device_online` | 讀 | 輪詢 `GET /v1/devices/{did}` 直到上線 |
+| control | `request_disable_autostart` | 讀（只發 token） | 終端機讀目前狀態 → 確認後 `Disable-ScheduledTask` 或 `Set-Service -StartupType Disabled` |
 | control | `request_set_data` | 讀（只發 token） | `latestdata`（讀目前值與 asm）→ 確認後 `PUT /v1/devicectrl/data` |
 | control | `request_kvm_session` | 讀（只發 token） | 確認後 `POST /v1/kvm`，回傳連線資訊給**人**（只能用 Portal 的瀏覽器 noVNC 開，不支援 UltraVNC） |
 | control | `request_protection_action` | 讀（只發 token） | `GET /v1/protection/devices/{did}` → 確認後 `PUT /v1/protection/device` |
 | control | `request_recovery_action` | 讀（只發 token） | `GET /v1/recovery/devices/{did}` → 確認後 `PUT /v1/recovery/device` |
 | logs | `fetch_device_log` | 讀 | 預設：遠端終端機執行固定的 `Get-WinEvent` 查詢；`source=devlog`：`/v1/devlog/requests` |
+| logs | `analyze_last_shutdown` | 讀 | 終端機執行固定的唯讀查詢（關機相關 System 事件、Application 警告／錯誤、目前記憶體前幾名）+ `histdata`（離線前的記憶體／CPU） |
 | remote | `request_run_command` | 讀（只發 token） | 確認後經遠端終端機（SYSTEM）或 Launch Remote Process（使用者） |
 | （自動） | `confirm_action` | **寫（破壞性）** | 執行任何 `request_*` 準備好的動作（包括 kill） |
 
@@ -57,13 +63,13 @@ AI Agent (OpenClaw)  ──MCP──▶  DeviceOn MCP Server  ──REST /rmm/v1
 - **稽核記錄**：每次 kill 的申請、執行、中止都會寫進 `deviceon_mcp.audit` logger（輸出到 stderr）。DeviceOn 端也會留下 `SetKillPrc` 操作事件。
 - **所有會改變裝置的動作都是兩段式**：`request_*` 只做檢查，回傳摘要、警示和 token（工具標成 readOnly），`confirm_action` 才真的執行。檢查內容依工具而定：開關機比對裝置支援的動作和在線狀態；寫入資料拒絕唯讀或不存在的感測器並列出「目前值 → 新值」；保護／還原檢查軟體是否已安裝、啟用，遠端還原前確認遠端備份存在。
 - **LLM 自己寫的腳本（`remote` toolset）**：要同時設定 `DEVICEON_TOOLSETS` 含 `remote` **和** `DEVICEON_ALLOW_REMOTE_COMMAND=true` 才會開啟。摘要會附上完整腳本；拒絕 `-EncodedCommand`（看不出內容）；對刪除、格式化、關機、停服務、kill、改登錄檔、改帳號、下載、動態執行、改安全設定、提到受保護的 process 等寫法加上警示。腳本上限 2500 字元。
-- **YOLO 模式（`DEVICEON_AUTO_CONFIRM`，預設關閉）**：列出的動作（逗號分隔，或 `all`）在 `request_*` 就直接執行並回傳結果（`auto_confirmed: true`），不發 token、不用 `confirm_action`，適合反覆調整腳本的開發／測試情境。動作名稱：`run_command`、`kill_process`、`power`、`set_data`、`kvm`、`protection`、`recovery`。
+- **YOLO 模式（`DEVICEON_AUTO_CONFIRM`，預設關閉）**：列出的動作（逗號分隔，或 `all`）在 `request_*` 就直接執行並回傳結果（`auto_confirmed: true`），不發 token、不用 `confirm_action`，適合反覆調整腳本的開發／測試情境。動作名稱：`run_command`、`kill_process`、`power`、`set_data`、`kvm`、`protection`、`recovery`、`wol_config`、`disable_autostart`。
   - 仍然有效的檢查：保護清單、PID 重用、拒絕 `-EncodedCommand`、腳本長度、在線狀態等 request 階段的檢查都照做；稽核記錄會多一行 `action auto-confirmed (YOLO)`。
   - **命中風險樣式的腳本仍然要確認**：`run_command` 在 YOLO 下只自動執行沒有風險警示的腳本（例如查詢類）；有刪除、停服務、kill 等警示的會照常回傳 token 和 `auto_confirm_skipped`。
   - 寫錯名稱或該動作所屬的 toolset 沒開，server 會拒絕啟動。開啟後對應的 `request_*` 工具會改標成 destructive，server instructions 也會告訴 Agent 不用先詢問。
   - 在 Claude Code，`request_*` 已在 `allow`，所以 YOLO 的動作完全不會跳出視窗；`confirm_action` 保留在 `ask`，只有被判定為風險的請求才會用到。建議只在個人環境用 `"DEVICEON_AUTO_CONFIRM": "run_command"`，不要寫進共用的 `.mcp.json`，也不要和 HTTP 模式一起用。
 - **防 prompt injection**：process 名稱、視窗標題、log、截圖、指令輸出都來自裝置，回傳時都標註為不可信資料；server 的 instructions 也要求 Agent 不要照著裝置資料裡的文字行動。
-- **權限**：使用 DeviceOn 帳號呼叫 API，沿用 DeviceOn 原本的角色和裝置群組權限。建議建立專用的服務帳號，只授予 `GetData`、`GetSensor`（`intermittent_report` 需要）、`GetProcess`、`EditProcess` 權限，以及目標裝置群組。
+- **權限**：使用 DeviceOn 帳號呼叫 API，沿用 DeviceOn 原本的角色和裝置群組權限。建議建立專用的服務帳號，只授予 `GetData`、`GetSensor`（`intermittent_report` 需要）、`GetProcess`、`EditProcess` 權限，以及目標裝置群組。要用 `request_configure_wol` 時另外需要 `EditDevice`。
 
 ### 遠端執行是怎麼做的
 
@@ -100,14 +106,15 @@ src/deviceon_mcp/
 └── tools/
     ├── __init__.py     # TOOLSETS 註冊表（有需要確認的動作時自動加上 confirm_action）
     ├── common/         # list_devices、confirm_action
-    ├── diagnose/       # metrics.py、processes.py、windows.py
-    ├── control/        # capabilities、power、screenshot、data、kvm、protect
-    ├── logs/           # eventlog.py
+    ├── diagnose/       # metrics.py、processes.py、windows.py、autostart.py
+    ├── control/        # capabilities、power、wake（WOL 代理）、autostart（停用排程／服務）、screenshot、data、kvm、protect
+    ├── logs/           # eventlog.py、shutdown.py（關機原因分析）
     └── remote/         # command.py
 simulator/
 ├── windows/            # cpu_hog.exe（C#，build.bat 以內建 .NET Framework 4 編譯）
 ├── windows-task/       # mem_leak.exe + install.ps1 / uninstall.ps1（工作排程器觸發的記憶體暴增）
 ├── windows-hang/       # hang_app.exe（WinForms 視窗死結 →「沒有回應」，CPU≈0%、記憶體平穩）
+├── windows-shutdown/   # pressure_leak.exe + mem_guard.exe（記憶體壓力累積 → 保護性關機，開機後再犯）
 └── stress_sim.py       # Linux 用的 Python 版
 scripts/
 └── probe_process_fields.py  # 直接看 agent 回報的原始 process 欄位（例如 IsActive）
@@ -208,7 +215,13 @@ echo $env:DEVICEON_BASE_URL     # 應顯示剛才設定的網址
       "mcp__deviceon__request_kvm_session",
       "mcp__deviceon__request_protection_action",
       "mcp__deviceon__request_recovery_action",
-      "mcp__deviceon__request_run_command"
+      "mcp__deviceon__request_run_command",
+      "mcp__deviceon__find_process_autostart",
+      "mcp__deviceon__find_wol_relay_candidates",
+      "mcp__deviceon__wait_for_device_online",
+      "mcp__deviceon__analyze_last_shutdown",
+      "mcp__deviceon__request_configure_wol",
+      "mcp__deviceon__request_disable_autostart"
     ],
     "ask": [
       "mcp__deviceon__confirm_action"
@@ -253,7 +266,7 @@ setx DEVICEON_AUTO_CONFIRM "run_command"      # 只讓遠端指令免確認（�
 # setx DEVICEON_AUTO_CONFIRM "all"            # 全部免確認，包括關機、還原，不建議
 ```
 
-可用的名稱：`run_command`、`kill_process`、`power`、`set_data`、`kvm`、`protection`、`recovery`，或 `all`。
+可用的名稱：`run_command`、`kill_process`、`power`、`set_data`、`kvm`、`protection`、`recovery`、`wol_config`、`disable_autostart`，或 `all`。
 
 **步驟 3：確認列出的動作所屬的 toolset 有開**。例如 `run_command` 需要 `DEVICEON_TOOLSETS` 包含 `remote`，並設定 `DEVICEON_ALLOW_REMOTE_COMMAND=true`；`kill_process`、`power` 等需要 `control`。沒開的話 server 會拒絕啟動。
 
@@ -513,6 +526,53 @@ Get-Content $env:TEMP\deviceon-sim\hang_app.log   # PID、啟動時間、死結�
 ```powershell
 python scripts\probe_process_fields.py --device <裝置名稱> --name hang_app --duration 180
 ```
+
+### 情境四：記憶體壓力累積 → 保護性關機 → 透過鄰近裝置喚醒 → 分析原因並修正（Windows）
+
+模擬「某個程式的記憶體只增不減，最後監控程式為了保護機台把它關機，而且每次開機都會再犯」。有兩個程式，分別扮演**元兇**和**按下關機的人**：
+
+| 程式 | 角色 | 行為 |
+|---|---|---|
+| `pressure_leak.exe` | 元兇 | 開機後延遲 `-LeakStartDelaySec` 秒，每分鐘多配置 `-LeakMBPerMin` MB 且永不釋放，並輪流重寫已持有的記憶體（約每 20 秒一輪）讓它留在 RAM；實體負載到 `-LeakMaxLoadPercent` 或 commit 到 `-LeakMaxCommitPercent` 時停止成長、繼續持有；發生 OOM 後暫停 60 秒 |
+| `mem_guard.exe` | 保護性監控（模擬工業機台常見的 watchdog） | **實體負載 ≥ `-ThresholdPercent` 或 commit ≥ `-CommitThresholdPercent`** 持續 `-SustainSeconds` 秒 → 在 Application 記錄寫入警告（來源 `DeviceOnSim`、事件 3001，列出前 5 名記憶體使用者）→ 有 `-Arm` 才真的呼叫 `InitiateSystemShutdownEx` 關機（S5，WOL 叫得醒）。每 5 分鐘記一行 heartbeat |
+
+> **第一次實機測試（2026-11-19，DS054，16 GB，`-LeakMBPerMin 2048`）沒有關機，原因**：舊版 leak 每個 page 只寫一次，Windows 把它們換頁到 page file，實體負載一直在 30–77% 擺動；leak 持有到 40 GB、commit 用完（`OutOfMemoryException`），機器因大量換頁而卡死，但只看實體負載的 mem_guard 從未觸發。現在 guard 也看 commit（Windows 上的「記憶體用完」指的是 commit），leak 會保持記憶體常駐並在 commit 95% 停下。速率建議不要超過 512 MB/min（腳本上限 1024）。
+
+兩個都是以 SYSTEM 身分、**開機時**啟動的排程工作（`\DeviceOnSim\PressureLeak`、`\DeviceOnSim\MemGuard`），所以被 WOL 喚醒後，即使沒人登入，記憶體又會開始累積。真正的修正是停用 `PressureLeak` 排程，kill 只能撐到下次開機。
+
+```powershell
+cd simulator\windows-shutdown
+.\build.bat                                   # 產生 pressure_leak.exe、mem_guard.exe（x64）
+# 複製 *.exe、install.ps1、uninstall.ps1 到裝置上，以系統管理員執行：
+.\install.ps1 -RunNow                         # 演練：全部照做，但只記錄 DRY RUN，不關機
+.\install.ps1 -Arm -RunNow                    # 實際：腳本會依目前的實體負載與 commit 印出預估觸發時間
+.\install.ps1 -Arm -RunNow -LeakMBPerMin 512  # 加快（建議上限）
+Get-Content C:\ProgramData\DeviceOnSim\Shutdown\mem_guard.log -Wait
+.\uninstall.ps1                               # 移除排程、結束 process、取消已排定的關機（shutdown /a）
+```
+
+**WOL 前置條件**（這個情境的前提，DeviceOn 無法替你檢查）：裝置 BIOS 開啟 Wake on LAN／PME、關閉 ErP／Deep Sx；網卡允許 Magic Packet 喚醒；有線網路；在 Portal 把 WOL 設成「代理模式」，代理裝置要和它在**同一個廣播網域**且在線。
+
+**預期的 Agent 流程**：
+
+1. `list_devices(offline_only=true)` → 發現 DS054-H5T3KU4 離線，`wakeOnLan.mode = agent`
+2. `find_wol_relay_candidates(did)` → 列出在線且同子網路的裝置（用候選裝置自己的 `Get-NetIPAddress` 判斷，不是猜 /24）。目前的代理裝置已經合適就回報「不需更改」；否則**詢問使用者**後 `request_configure_wol(mode='agent', relay_did=…)` → `confirm_action`
+3. `request_power_action(action='start')` → 詢問使用者 → `confirm_action` → `wait_for_device_online`（Portal 每 10 秒重送一次，最多 10 分鐘）
+4. `analyze_last_shutdown(did)` → `kind=initiated`、`initiated_by=mem_guard.exe`；`suspects[0]=pressure_leak.exe`（證據：關機註解、事件 2004、離線前 DeviceOn 的記憶體曲線持續上升）；`findings` 指出 mem_guard 只是按下按鈕，而且 pressure_leak.exe **開機後又在跑了**
+5. 向使用者說明原因與解方 → 詢問 → `request_kill_process` + `find_process_autostart(['pressure_leak.exe'])` → `request_disable_autostart(kind='scheduled_task', name='\DeviceOnSim\PressureLeak')` → `confirm_action`
+
+**DeviceOn 的 WOL 是怎麼運作的**（已讀過後端原始碼）：`PUT /power/device action=start` 變成 `commCmd 999`，Worker 攔下來不轉給 agent，每 10 秒依 `wolmode` 送一次 magic packet，直到裝置上線或 10 分鐘逾時：1＝伺服器自己廣播、2＝要求 `wolrepeater` 指定的在線 agent 在它的 LAN 廣播（`commCmd 85` + 目標 MAC）、3＝送到 `wolrepeater` 的 IP。`wolmode=0` 或代理裝置離線時 **Worker 什麼都不做，10 分鐘後才回報失敗**，所以 `request_power_action(start)` 會先擋下來。
+
+**已在實機驗證（2026-11-20）**：
+- `find_wol_relay_candidates(DS054)`：DESKTOP-MT3CC6E（172.22.12.255）和 wunhuei-desttop 都回報 `172.22.12.0/22`，包含 DS054 的 172.22.13.77。這兩個 IP 用 /24 判斷會被誤判成不同網段；Ubuntu 裝置標示為未驗證。
+- `analyze_last_shutdown(DS054)`：正確判斷上一次是使用者從開始功能表關機（`StartMenuExperienceHost.exe`、`interactive=true`），沒有誤指嫌疑程式。順便發現 DS054 在關機前後 CAgent.exe（EmbDDC.dll，0xc0000005）和 DeviceOn Agent 的 WindowsFeature.exe 多次 crash。
+- `find_process_autostart`、`request_disable_autostart` 的狀態讀取：正確找到 Edge 的排程與服務；agent 服務 `DeviceOnAgent` 會被拒絕。
+- 尚未實機跑過：模擬器實際關機、`PATCH /devices/wol`、透過 MCP 送出 `start`、停用排程的執行階段（都是寫入動作，需要你在場時跑）。
+
+**判斷邏輯的設計**：
+- 事件欄位一律從 XML 依名稱讀取（1074 的 `param1..7`、41 的 `BugcheckCode`／`PowerButtonTimestamp`、1000 的 `AppName`），不解析訊息文字，所以中文 Windows 也適用。
+- `kind`：`bugcheck`（藍屏）、`forced_power_button`（長按電源）、`unexpected`（斷電、當機、過熱）、`initiated`（有人或程式要求關機）、`clean_unknown`、`unknown`。
+- 只有在**有資源壓力的證據**時（事件 2004、離線前記憶體上升、或程式名稱出現在關機註解）才會說「X 只是按下按鈕，元兇是 Y」。Application Error、.NET Runtime、RestartManager、WMI 這類每次關機都會出現的事件只列為 crash 清單，不算嫌疑。
 
 ## 第一次接實機時要確認的事
 

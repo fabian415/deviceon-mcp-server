@@ -154,6 +154,40 @@ def wait_cmdline(run_id: str, wait_sec: int) -> str:
     return cmd
 
 
+JSON_EMIT = ("$o = ConvertTo-Json -InputObject $r -Depth 6 -Compress\n" + _B64_EMIT)
+
+
+async def run_json_probe(deps: Deps, dev: dict, script: str, timeout_sec: int = 60) -> object:
+    """Run a FIXED read-only PowerShell script as SYSTEM that leaves its result in $r; return it parsed.
+
+    Only for scripts built by this server (never AI-written text). Raises RemoteExecError on
+    transport problems, a timeout, or output that is not the expected JSON.
+    """
+    import json
+
+    if not is_windows(dev):
+        raise RemoteExecError("this check runs PowerShell and needs a Windows device.")
+    if "terminal" not in [p.get("plugin") for p in dev.get("plugins") or [] if isinstance(p, dict)]:
+        raise RemoteExecError(f"device {dev.get('did')} has no 'terminal' plugin.")
+    cmd = encode_ps(script + "\n" + JSON_EMIT)
+    check_length(cmd)
+    r = await _terminal(deps, dev.get("agentId") or dev["agentid"], cmd, timeout_sec)
+    text = decode_b64_output(r.output)
+    if text is None:
+        raise RemoteExecError(("timed out; " if not r.completed else "") + f"unexpected output: {r.output[-300:]!r}")
+    try:
+        return json.loads(text) if text.strip() else None
+    except ValueError as ex:
+        raise RemoteExecError(f"could not parse the device's answer: {text[:300]!r}") from ex
+
+
+def as_list(value: object) -> list:
+    """ConvertTo-Json turns one-element arrays into a bare object and empty ones into null."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
 async def _terminal(deps: Deps, agent_id: str, cmdline: str, timeout: float, windows: bool = True) -> TerminalResult:
     try:
         return await deps.terminal.run(agent_id, cmdline, timeout, windows)

@@ -1,4 +1,5 @@
-"""Toolset 'control': device-level commands (process kill, power, screenshot, data, KVM, protection, recovery).
+"""Toolset 'control': device-level commands (process kill, power and wake-up, screenshot, data, KVM,
+protection, recovery, autostart).
 
 Every state-changing tool here is step 1 of 2: it validates, returns a summary and a
 confirm_token, and does nothing else. The change happens only in confirm_action (toolset
@@ -10,14 +11,14 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import Context, FastMCP, Image
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ...actions import register_action, request_annotations
 from ...deps import Deps
 from ..common import ALWAYS_LOAD
-from . import capabilities, data, kill, kvm, power, protect, screenshot
+from . import autostart, capabilities, data, kill, kvm, power, protect, screenshot, wake
 
 Did = Annotated[int, Field(description="Device id (did) from list_devices")]
 Reason = Annotated[str, Field(description="Short justification shown to the user")]
@@ -29,6 +30,8 @@ def register(mcp: FastMCP, deps: Deps) -> None:
     register_action(deps, kvm.ACTION, "Start remote-desktop (KVM) session", kvm.execute)
     register_action(deps, protect.PROTECTION_ACTION, "Protection action", protect.execute_protection)
     register_action(deps, protect.RECOVERY_ACTION, "Backup / recovery action", protect.execute_recovery)
+    register_action(deps, wake.ACTION_CONFIG, "Configure Wake-on-LAN", wake.execute_config)
+    register_action(deps, autostart.ACTION, "Disable autostart", autostart.execute)
 
     @mcp.tool(annotations=ToolAnnotations(title="Get device capabilities", readOnlyHint=True, openWorldHint=False), meta=ALWAYS_LOAD)
     async def get_device_capabilities(did: Did) -> dict:
@@ -147,5 +150,69 @@ def register(mcp: FastMCP, deps: Deps) -> None:
         """
         return await protect.request_recovery_action(deps, did, action, remote, asz_percent, reason)
 
+    @mcp.tool(annotations=ToolAnnotations(title="Find Wake-on-LAN relay candidates", readOnlyHint=True, openWorldHint=False))
+    async def find_wol_relay_candidates(
+        did: Did,
+        verify: Annotated[bool, Field(description="Ask the closest candidates for their real subnet over the terminal (recommended)")] = True,
+        max_verify: Annotated[int, Field(description="How many candidates to verify (0-10)")] = 5,
+    ) -> dict:
+        """Find online devices near a shut-down device that can wake it up (Wake-on-LAN agent mode).
 
+        Use when a device is offline/shut down and should be powered on remotely. Ranks online
+        devices by IP closeness to the target's last IP and, with verify=true, checks that each
+        candidate's own subnet contains it (broadcasts do not cross routers). Also reports the
+        target's current Wake-on-LAN config and when it was last seen. Read-only; to apply a
+        relay ask the user, then request_configure_wol.
+        """
+        return await wake.find_wol_relay_candidates(deps, did, verify, max_verify)
 
+    @mcp.tool(annotations=request_annotations(deps, wake.ACTION_CONFIG, "Request Wake-on-LAN config"))
+    async def request_configure_wol(
+        did: Did,
+        mode: Annotated[Literal["agent", "direct", "repeater", "off"],
+                        Field(description="'agent' (recommended) = a neighbouring DeviceOn device sends the wake-up packet; "
+                                          "'direct' = the server does; 'repeater' = sent to relay_ip; 'off' = disable")],
+        relay_did: Annotated[int | None, Field(description="mode='agent': did of the online device on the same subnet (from find_wol_relay_candidates)")] = None,
+        relay_ip: Annotated[str | None, Field(description="mode='repeater': IPv4 address that forwards the packet")] = None,
+        reason: Reason = "",
+    ) -> dict:
+        """Prepare changing a device's Wake-on-LAN mode / relay. Does NOT change anything yet.
+
+        Checks the relay exists, is not the device itself and (when possible) shares its subnet,
+        then returns a confirm_token with a current -> new summary. Call confirm_action only
+        after the user agrees.
+        """
+        return await wake.request_configure_wol(deps, did, mode, relay_did, relay_ip, reason)
+
+    @mcp.tool(annotations=ToolAnnotations(title="Wait for device online", readOnlyHint=True, openWorldHint=False))
+    async def wait_for_device_online(
+        did: Did,
+        ctx: Context,
+        timeout_sec: Annotated[int, Field(description="Max wait (15-1800). DeviceOn resends Wake-on-LAN for 600 s.")] = 600,
+        poll_sec: Annotated[int, Field(description="Seconds between checks (5-60)")] = 15,
+    ) -> dict:
+        """Wait until a device reconnects to DeviceOn, e.g. after request_power_action(start) or a restart.
+
+        Blocks until the device is online or timeout_sec passes. Read-only.
+        """
+        async def progress(done: float, total: float, msg: str) -> None:
+            await ctx.report_progress(done, total, msg)
+
+        return await wake.wait_for_device_online(deps, did, timeout_sec, poll_sec, progress)
+
+    @mcp.tool(annotations=request_annotations(deps, autostart.ACTION, "Request disable autostart"))
+    async def request_disable_autostart(
+        did: Did,
+        kind: Annotated[Literal["scheduled_task", "service"], Field(description="What starts the program (from find_process_autostart)")],
+        name: Annotated[str, Field(description="Full task path such as '\\Vendor\\Updater', or the service's short Name")],
+        stop_running: Annotated[bool, Field(description="Also stop the instance it started now")] = True,
+        reason: Reason = "",
+    ) -> dict:
+        """Prepare disabling a scheduled task or service so a program stops starting on its own. Does NOT change anything yet.
+
+        Use after find_process_autostart, when a process keeps coming back (e.g. after every
+        boot). Refuses Windows' own tasks, shared svchost services and the DeviceOn agent;
+        the summary shows the current state and how to undo. Call confirm_action only after
+        the user agrees.
+        """
+        return await autostart.request_disable_autostart(deps, did, kind, name, stop_running, reason)

@@ -9,7 +9,9 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ...deps import Deps
-from . import eventlog
+from . import eventlog, shutdown
+
+Did = Annotated[int, Field(description="Device id (did) from list_devices")]
 
 
 def register(mcp: FastMCP, deps: Deps) -> None:
@@ -34,3 +36,19 @@ def register(mcp: FastMCP, deps: Deps) -> None:
         shortened message per event. Read-only.
         """
         return await eventlog.fetch_device_log(deps, did, log_name, since_minutes, level, contains, max_events, source)
+
+    @mcp.tool(annotations=ToolAnnotations(title="Analyze last shutdown", readOnlyHint=True, openWorldHint=False))
+    async def analyze_last_shutdown(
+        did: Did,
+        lookback_hours: Annotated[int, Field(description="How far back to read the event logs (1-168). Must cover the shutdown.")] = 24,
+    ) -> dict:
+        """Explain why a Windows device went down (shutdown, crash or power loss), after it is back online.
+
+        Use right after a device was woken up / restarted (e.g. after wait_for_device_online).
+        Reads the shutdown-related System events, Application warnings/errors and current top
+        memory users on the device, plus DeviceOn's memory/CPU history before it went offline.
+        Returns previous_shutdown.kind (initiated / unexpected / bugcheck / forced_power_button /
+        clean_unknown / unknown), who initiated it, suspects with evidence, findings and
+        suggested_fixes. Read-only (~5-20 s).
+        """
+        return await shutdown.analyze_last_shutdown(deps, did, lookback_hours)

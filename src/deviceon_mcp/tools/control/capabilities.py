@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 from ...client import DeviceOnError
 from ...deps import Deps
 from ..common.devices import device_ref, get_device_checked, plugin_names
+from .wake import wol_status
 
 # DeviceOn action -> tokens that may appear in the device's power functionList.
 # PowerCtrl checks "suspend" for sleep and the agent reports "wol" for Wake-on-LAN.
@@ -51,6 +52,27 @@ async def _safe(fn: Callable[[], Awaitable[Any]]) -> tuple[Any, str | None]:
         return None, str(ex)
 
 
+async def supported_power_actions(deps: Deps, dev: dict) -> tuple[list[str], str | None]:
+    """Power actions the device supports: the power API's functionList, else the one on the device record.
+
+    The device record keeps functionList while the device is offline, which is exactly when 'start' matters.
+    """
+    power, err = await _safe(lambda: deps.client.get_power(dev["did"]))
+    actions = power_actions((power or {}).get("functionList"))
+    if not actions:
+        actions = power_actions(dev.get("functionList"))
+    return actions, (err if not actions else None)
+
+
+def power_plugin_needed(dev: dict) -> bool:
+    """Only an online device needs the power_onoff plugin.
+
+    An offline device reports an empty plugin list, and Wake-on-LAN is sent by the server or a relay
+    agent, never by the sleeping device itself.
+    """
+    return bool(dev.get("connected"))
+
+
 async def get_device_capabilities(deps: Deps, did: int) -> dict:
     dev = await get_device_checked(deps, did)
     plugins = plugin_names(dev)
@@ -59,14 +81,15 @@ async def get_device_capabilities(deps: Deps, did: int) -> dict:
     tools: dict[str, Any] = {}
     notes: list[str] = []
 
-    if "power_onoff" in plugins:
-        power, err = await _safe(lambda: deps.client.get_power(did))
-        actions = power_actions((power or {}).get("functionList"))
+    if "power_onoff" in plugins or not power_plugin_needed(dev):
+        actions, err = await supported_power_actions(deps, dev)
         usable = [a for a in actions if (a == "start") != online]
         tools["request_power_action"] = {
             "available": bool(usable), "supported_actions": actions, "usable_now": usable,
             **({"error": err} if err else {}),
         }
+        if "start" in actions:
+            tools["wake_on_lan"] = await wol_status(deps, dev)
     else:
         tools["request_power_action"] = {"available": False, "reason": "no power_onoff plugin"}
 
@@ -107,5 +130,8 @@ async def get_device_capabilities(deps: Deps, did: int) -> dict:
 
     tools["remote_command"] = {"launch_process": "ProcessMonitor" in plugins, "terminal": "terminal" in plugins}
     if not online:
-        notes.append("device is offline: only request_power_action(action='start') can work")
+        notes.append("device is offline, so DeviceOn reports no plugins for it; the 'no ... plugin' reasons above "
+                     "may only mean 'offline'. Re-check after it is back online.")
+        notes.append("device is offline: only request_power_action(action='start') can work "
+                     "(see tools.wake_on_lan; find_wol_relay_candidates helps pick a relay)")
     return {"device": {**device_ref(dev), "os": dev.get("ostype")}, "plugins": plugins, "tools": tools, "notes": notes}

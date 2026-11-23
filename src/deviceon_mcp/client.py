@@ -74,9 +74,16 @@ class DeviceOnClient:
         connected: bool | None = None,
         page_size: int = 20,
         page_no: int = 1,
+        order_by: str | None = None,
+        order_type: str = "asc",
     ) -> dict:
-        """GET /v1/devicegroups/devices (DeviceGroupMgmt, 'Get Devices/AllGroup')."""
+        """GET /v1/devicegroups/devices (DeviceGroupMgmt, 'Get Devices/AllGroup').
+
+        order_by is a deviceview column (name, connected, logints, createts, ...)."""
         params: dict[str, Any] = {"pageSize": page_size, "no": page_no}
+        if order_by:
+            params["orderBy"] = order_by
+            params["orderType"] = order_type
         if like:
             params["like"] = like
             params["likeField"] = like_field
@@ -197,6 +204,16 @@ class DeviceOnClient:
     async def power_device(self, did: int, action: str) -> dict:
         """PUT /v1/power/device {"did", "action": sleep|hibernate|shutdown|restart|start}."""
         return await self._request("PUT", "/v1/power/device", json={"did": did, "action": action}) or {}
+
+    async def set_wol(self, did: int, wolmode: int, wolrepeater: str) -> dict:
+        """PATCH /v1/devices/wol (DeviceMgmt.editWOL, needs EditDevice) -> {"result": bool}.
+
+        wolmode 0 = not set (wolrepeater ""), 1 = direct: the server broadcasts (""),
+        2 = agent: another online agent on the device's LAN sends it (wolrepeater = its agentId),
+        3 = repeater: the server sends to an IP that forwards it (wolrepeater = IPv4).
+        """
+        body = {"devices": [{"did": did, "wolmode": wolmode, "wolrepeater": wolrepeater}]}
+        return await self._request("PATCH", "/v1/devices/wol", json=body) or {}
 
     # ---- screenshot ----------------------------------------------------
 
